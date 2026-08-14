@@ -14,28 +14,60 @@
 # limitations under the License.
 # ==============================================================================
 
+# ==============================================================================
+# BSD 3-Clause License
+#
+# Copyright (c) 2007-2026 The scikit-learn developers.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# * Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+#
+# * Neither the name of the copyright holder nor the names of its
+#   contributors may be used to endorse or promote products derived from
+#   this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# ==============================================================================
+
 # daal4py TSNE scikit-learn-compatible class
 
 import warnings
 from time import time
 
 import numpy as np
-from scipy.sparse import issparse
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE as BaseTSNE
 from sklearn.manifold._t_sne import _joint_probabilities, _joint_probabilities_nn
 from sklearn.metrics.pairwise import pairwise_distances
 from sklearn.utils import check_array, check_random_state
-from sklearn.utils.validation import check_non_negative
+from sklearn.utils.validation import check_non_negative, validate_data
 
 import daal4py
 from daal4py.sklearn._utils import (
     PatchingConditionsChain,
+    check_is_array_api,
     daal_check_version,
+    is_sparse,
     sklearn_check_version,
 )
 
-from .._device_offload import support_usm_ndarray
 from .._n_jobs_support import control_n_jobs
 from ..neighbors import NearestNeighbors
 
@@ -44,14 +76,11 @@ from ..neighbors import NearestNeighbors
 class TSNE(BaseTSNE):
     __doc__ = BaseTSNE.__doc__
 
-    if sklearn_check_version("1.2"):
-        _parameter_constraints: dict = {**BaseTSNE._parameter_constraints}
+    _parameter_constraints: dict = {**BaseTSNE._parameter_constraints}
 
-    @support_usm_ndarray()
     def fit_transform(self, X, y=None):
         return super().fit_transform(X, y)
 
-    @support_usm_ndarray()
     def fit(self, X, y=None):
         return super().fit(X, y)
 
@@ -68,20 +97,14 @@ class TSNE(BaseTSNE):
             [n_samples],
             [P.nnz],
             [self.n_iter_without_progress],
-            [self._max_iter if sklearn_check_version("1.5") else self.n_iter],
+            [self.max_iter if sklearn_check_version("1.7") else self._max_iter],
         ]
 
         # Pass params to daal4py backend
         if daal_check_version((2023, "P", 1)):
             size_iter.extend(
                 [
-                    [
-                        (
-                            self._EXPLORATION_MAX_ITER
-                            if sklearn_check_version("1.5")
-                            else self._EXPLORATION_N_ITER
-                        )
-                    ],
+                    [self._EXPLORATION_MAX_ITER],
                     [self._N_ITER_CHECK],
                 ]
             )
@@ -118,38 +141,64 @@ class TSNE(BaseTSNE):
 
         return X_embedded
 
+    # Comment 2025-11-24: This appears to be a copy-paste from an earlier version of the original
+    # scikit-learn with some modifications to make calls to oneDAL under a narrow subset of
+    # allowed input parameters, copy-pastying the rest of the sklearn code when oneDAL is not
+    # called. Note that the conditions checked here are out of synch with the latest sklearn by now.
+    # An early 'is supported' check that offloads to stock sklearn was added later on, which results
+    # in having a lot of dead code paths in this function that can be safely removed.
+    # Note: this method is called from inside 'fit' from the base class in stock scikit-learn.
+    # Hence, the offloading logic is different than in other classes, as falling back to 'fit'
+    # from the base class would lead to a circular loop.
     def _fit(self, X, skip_num_points=0):
         """Private function to fit the model using X as training data."""
-        if isinstance(self.init, str) and self.init == "warn":
-            warnings.warn(
-                "The default initialization in TSNE will change "
-                "from 'random' to 'pca' in 1.2.",
-                FutureWarning,
-            )
-            self._init = "random"
-        else:
-            self._init = self.init
 
-        if isinstance(self._init, str) and self._init == "pca" and issparse(X):
-            raise TypeError(
-                "PCA initialization is currently not suported "
-                "with the sparse input matrix. Use "
-                'init="random" instead.'
-            )
+        _patching_status = PatchingConditionsChain("sklearn.manifold.TSNE._tsne")
+        _patching_status.and_conditions(
+            [
+                (
+                    self.method == "barnes_hut",
+                    'Used t-SNE method is not "barnes_hut" which is the only supported.',
+                ),
+                (self.n_components == 2, "Number of components != 2."),
+                (self.verbose == 0, "Verbose mode is set."),
+                (
+                    daal_check_version((2021, "P", 600)),
+                    "oneDAL version is lower than 2021.6.",
+                ),
+                # Scikit-learn didn't support sparse PCA initialization before 1.8.
+                # This nevertheless offloads it to sklearn because it produces a different
+                # error message than what would be thrown by simply passing the input to PCA.
+                (
+                    sklearn_check_version("1.8")
+                    or not (
+                        isinstance(self.init, str) and self.init == "pca" and is_sparse(X)
+                    ),
+                    "PCA initialization is not supported with sparse input matrices before scikit-learn 1.8.",
+                ),
+                # Note: these conditions below should result in errors, but stock scikit-learn
+                # does not check for errors at this exact point. Hence, this offloads the erroring
+                # out to the base class, wherever in the process they might be encountered.
+                (
+                    np.isscalar(self.angle) and self.angle > 0.0 and self.angle < 1.0,
+                    "'angle' must be between 0.0 - 1.0",
+                ),
+                (self.early_exaggeration >= 1.0, "early_exaggeration must be at least 1"),
+                (
+                    (isinstance(self.init, str) and self.init in ["random", "pca"])
+                    or isinstance(self.init, np.ndarray),
+                    "'init' must be 'exact', 'pca', or a numpy array.",
+                ),
+                (not check_is_array_api(X), "Array API inputs are not supported."),
+            ]
+        )
+        _dal_ready = _patching_status.get_status(logs=True)
+        if not _dal_ready:
+            return super()._fit(X, skip_num_points)
 
-        if self.method not in ["barnes_hut", "exact"]:
-            raise ValueError("'method' must be 'barnes_hut' or 'exact'")
-        if self.angle < 0.0 or self.angle > 1.0:
-            raise ValueError("'angle' must be between 0.0 - 1.0")
-        if self.learning_rate == "warn":
-            warnings.warn(
-                "The default learning rate in TSNE will change "
-                "from 200.0 to 'auto' in 1.2.",
-                FutureWarning,
-            )
-            self._learning_rate = 200.0
-        else:
-            self._learning_rate = self.learning_rate
+        self._init = self.init
+
+        self._learning_rate = self.learning_rate
         if self._learning_rate == "auto":
             self._learning_rate = X.shape[0] / self.early_exaggeration / 4
             self._learning_rate = np.maximum(self._learning_rate, 50)
@@ -159,42 +208,30 @@ class TSNE(BaseTSNE):
                     "'learning_rate' must be a positive number " "or 'auto'."
                 )
         # rename attribute for compatibility with sklearn>=1.2
-        if sklearn_check_version("1.2"):
-            self.learning_rate_ = self._learning_rate
+        self.learning_rate_ = self._learning_rate
 
         if hasattr(self, "square_distances"):
-            if sklearn_check_version("1.1"):
-                if self.square_distances != "deprecated":
-                    warnings.warn(
-                        "The parameter `square_distances` has not effect "
-                        "and will be removed in version 1.3.",
-                        FutureWarning,
-                    )
-            else:
-                if self.square_distances not in [True, "legacy"]:
-                    raise ValueError("'square_distances' must be True or 'legacy'.")
-                if self.metric != "euclidean" and self.square_distances is not True:
-                    warnings.warn(
-                        "'square_distances' has been introduced in 0.24 to help phase "
-                        "out legacy squaring behavior. The 'legacy' setting will be "
-                        "removed in 1.1 (renaming of 0.26), and the default setting "
-                        "will be changed to True. In 1.3, 'square_distances' will be "
-                        "removed altogether, and distances will be squared by "
-                        "default. Set 'square_distances'=True to silence this "
-                        "warning.",
-                        FutureWarning,
-                    )
+            if self.square_distances != "deprecated":
+                warnings.warn(
+                    "The parameter `square_distances` has not effect "
+                    "and will be removed in version 1.3.",
+                    FutureWarning,
+                )
 
         if self.method == "barnes_hut":
-            X = self._validate_data(
+            X = validate_data(
+                self,
                 X,
                 accept_sparse=["csr"],
                 ensure_min_samples=2,
                 dtype=[np.float32, np.float64],
             )
         else:
-            X = self._validate_data(
-                X, accept_sparse=["csr", "csc", "coo"], dtype=[np.float32, np.float64]
+            X = validate_data(
+                self,
+                X,
+                accept_sparse=["csr", "csc", "coo"],
+                dtype=[np.float32, np.float64],
             )
 
         if self.metric == "precomputed":
@@ -212,35 +249,18 @@ class TSNE(BaseTSNE):
                 "should contain positive distances.",
             )
 
-            if self.method == "exact" and issparse(X):
+            if self.method == "exact" and is_sparse(X):
                 raise TypeError(
                     'TSNE with method="exact" does not accept sparse '
                     'precomputed distance matrix. Use method="barnes_hut" '
                     "or provide the dense distance matrix."
                 )
 
-        if self.method == "barnes_hut" and self.n_components > 3:
-            raise ValueError(
-                "'n_components' should be inferior to 4 for the "
-                "barnes_hut algorithm as it relies on "
-                "quad-tree or oct-tree."
-            )
         random_state = check_random_state(self.random_state)
-
-        if self.early_exaggeration < 1.0:
-            raise ValueError(
-                "early_exaggeration must be at least 1, but is {}".format(
-                    self.early_exaggeration
-                )
-            )
-
-        if not sklearn_check_version("1.2"):
-            if self.n_iter < 250:
-                raise ValueError("n_iter should be at least 250")
 
         n_samples = X.shape[0]
 
-        neighbors_nn = None
+        # neighbors_nn = None # <- unused variable in stock sklearn, commented out due to coverity
         if self.method == "exact":
             # Retrieve the distance matrix, either using the precomputed one or
             # computing it.
@@ -258,9 +278,7 @@ class TSNE(BaseTSNE):
                     # Also, Euclidean is slower for n_jobs>1, so don't set here
                     distances = pairwise_distances(X, metric=self.metric, squared=True)
                 else:
-                    metric_params_ = {}
-                    if sklearn_check_version("1.1"):
-                        metric_params_ = self.metric_params or {}
+                    metric_params_ = self.metric_params or {}
                     distances = pairwise_distances(
                         X, metric=self.metric, n_jobs=self.n_jobs, **metric_params_
                     )
@@ -270,10 +288,7 @@ class TSNE(BaseTSNE):
                     "All distances should be positive, the " "metric given is not correct"
                 )
 
-            if (
-                self.metric != "euclidean"
-                and getattr(self, "square_distances", True) is True
-            ):
+            if self.metric != "euclidean":
                 distances **= 2
 
             # compute the joint probability distribution for the input space
@@ -295,22 +310,13 @@ class TSNE(BaseTSNE):
                 print("[t-SNE] Computing {} nearest neighbors...".format(n_neighbors))
 
             # Find the nearest neighbors for every point
-            knn = None
-            if sklearn_check_version("1.1"):
-                knn = NearestNeighbors(
-                    algorithm="auto",
-                    n_jobs=self.n_jobs,
-                    n_neighbors=n_neighbors,
-                    metric=self.metric,
-                    metric_params=self.metric_params,
-                )
-            else:
-                knn = NearestNeighbors(
-                    algorithm="auto",
-                    n_jobs=self.n_jobs,
-                    n_neighbors=n_neighbors,
-                    metric=self.metric,
-                )
+            knn = NearestNeighbors(
+                algorithm="auto",
+                n_jobs=self.n_jobs,
+                n_neighbors=n_neighbors,
+                metric=self.metric,
+                metric_params=self.metric_params,
+            )
             t0 = time()
             knn.fit(X)
             duration = time() - t0
@@ -331,16 +337,12 @@ class TSNE(BaseTSNE):
             # Free the memory used by the ball_tree
             del knn
 
-            if (
-                getattr(self, "square_distances", True) is True
-                or self.metric == "euclidean"
-            ):
-                # knn return the euclidean distance but we need it squared
-                # to be consistent with the 'exact' method. Note that the
-                # the method was derived using the euclidean method as in the
-                # input space. Not sure of the implication of using a different
-                # metric.
-                distances_nn.data **= 2
+            # knn return the euclidean distance but we need it squared
+            # to be consistent with the 'exact' method. Note that the
+            # the method was derived using the euclidean method as in the
+            # input space. Not sure of the implication of using a different
+            # metric.
+            distances_nn.data **= 2
 
             # compute the joint probability distribution for the input space
             P = _joint_probabilities_nn(distances_nn, self.perplexity, self.verbose)
@@ -350,16 +352,14 @@ class TSNE(BaseTSNE):
         elif self._init == "pca":
             pca = PCA(
                 n_components=self.n_components,
-                svd_solver="randomized",
                 random_state=random_state,
             )
+            # Always output a numpy array, no matter what is configured globally
+            pca.set_output(transform="default")
             X_embedded = pca.fit_transform(X).astype(np.float32, copy=False)
-            warnings.warn(
-                "The PCA initialization in TSNE will change to "
-                "have the standard deviation of PC1 equal to 1e-4 "
-                "in 1.2. This will ensure better convergence.",
-                FutureWarning,
-            )
+            # PCA is rescaled so that PC1 has standard deviation 1e-4 which is
+            # the default value for random initialization. See issue #18018.
+            X_embedded = X_embedded / np.std(X_embedded[:, 0]) * 1e-4
         elif self._init == "random":
             # The embedding is initialized with iid samples from Gaussians with
             # standard deviation 1e-4.
@@ -369,40 +369,11 @@ class TSNE(BaseTSNE):
         else:
             raise ValueError("'init' must be 'pca', 'random', or " "a numpy array")
 
-        # Degrees of freedom of the Student's t-distribution. The suggestion
-        # degrees_of_freedom = n_components - 1 comes from
-        # "Learning a Parametric Embedding by Preserving Local Structure"
-        # Laurens van der Maaten, 2009.
-        degrees_of_freedom = max(self.n_components - 1, 1)
+        # Note: by this point, stock sklearn would calculate degrees of freedom, but oneDAL
+        # doesn't use them.
 
-        _patching_status = PatchingConditionsChain("sklearn.manifold.TSNE._tsne")
-        _patching_status.and_conditions(
-            [
-                (
-                    self.method == "barnes_hut",
-                    'Used t-SNE method is not "barnes_hut" which is the only supported.',
-                ),
-                (self.n_components == 2, "Number of components != 2."),
-                (self.verbose == 0, "Verbose mode is set."),
-                (
-                    daal_check_version((2021, "P", 600)),
-                    "oneDAL version is lower than 2021.6.",
-                ),
-            ]
-        )
-        _dal_ready = _patching_status.get_status(logs=True)
-
-        if _dal_ready:
-            X_embedded = check_array(X_embedded, dtype=[np.float32, np.float64])
-            return self._daal_tsne(P, n_samples, X_embedded=X_embedded)
-        return self._tsne(
-            P,
-            degrees_of_freedom,
-            n_samples,
-            X_embedded=X_embedded,
-            neighbors=neighbors_nn,
-            skip_num_points=skip_num_points,
-        )
+        X_embedded = check_array(X_embedded, dtype=[np.float32, np.float64])
+        return self._daal_tsne(P, n_samples, X_embedded=X_embedded)
 
     fit.__doc__ = BaseTSNE.fit.__doc__
     fit_transform.__doc__ = BaseTSNE.fit_transform.__doc__

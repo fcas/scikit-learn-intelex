@@ -1,4 +1,3 @@
-# ==============================================================================
 # Copyright 2024 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,113 +13,97 @@
 # limitations under the License.
 # ==============================================================================
 
-from abc import ABCMeta, abstractmethod
-
-import numpy as np
-
-from daal4py.sklearn._utils import get_dtype
-from onedal import _backend
-
-from ..common._policy import _get_policy
-from ..datatypes import _convert_to_supported, from_table, to_table
+from .._device_offload import supports_queue
+from ..common._backend import bind_default_backend
+from ..datatypes import from_table, return_type_constructor, to_table
+from ..utils import _sycl_queue_manager as QM
+from .basic_statistics import BasicStatistics
 
 
-class BaseBasicStatistics(metaclass=ABCMeta):
-    @abstractmethod
-    def __init__(self, result_options, algorithm):
-        self.options = result_options
-        self.algorithm = algorithm
+class IncrementalBasicStatistics(BasicStatistics):
+    """Incremental oneDAL low order moments estimator.
 
-    @staticmethod
-    def get_all_result_options():
-        return [
-            "min",
-            "max",
-            "sum",
-            "mean",
-            "variance",
-            "variation",
-            "sum_squares",
-            "standard_deviation",
-            "sum_squares_centered",
-            "second_order_raw_moment",
-        ]
+    Calculate basic statistics for data split into batches.
 
-    def _get_policy(self, queue, *data):
-        return _get_policy(queue, *data)
-
-    def _get_result_options(self, options):
-        if options == "all":
-            options = self.get_all_result_options()
-        if isinstance(options, list):
-            options = "|".join(options)
-        assert isinstance(options, str)
-        return options
-
-    def _get_onedal_params(self, dtype=np.float32):
-        options = self._get_result_options(self.options)
-        return {
-            "fptype": "float" if dtype == np.float32 else "double",
-            "method": self.algorithm,
-            "result_option": options,
-        }
-
-
-class IncrementalBasicStatistics(BaseBasicStatistics):
-    """
-    Incremental estimator for basic statistics based on oneDAL implementation.
-    Allows to compute basic statistics if data are splitted into batches.
     Parameters
     ----------
-    result_options: string or list, default='all'
-        List of statistics to compute
+    result_options : str or list, default=str('all')
+        List of statistics to compute.
 
-    Attributes (are existing only if corresponding result option exists)
+    algorithm : str, default=str('by_default')
+        Method for statistics computation.
+
+    Attributes
     ----------
-        min : ndarray of shape (n_features,)
+        min_ : ndarray of shape (n_features,)
             Minimum of each feature over all samples.
 
-        max : ndarray of shape (n_features,)
+        max_ : ndarray of shape (n_features,)
             Maximum of each feature over all samples.
 
-        sum : ndarray of shape (n_features,)
+        sum_ : ndarray of shape (n_features,)
             Sum of each feature over all samples.
 
-        mean : ndarray of shape (n_features,)
+        mean_ : ndarray of shape (n_features,)
             Mean of each feature over all samples.
 
-        variance : ndarray of shape (n_features,)
+        variance_ : ndarray of shape (n_features,)
             Variance of each feature over all samples.
 
-        variation : ndarray of shape (n_features,)
+        variation_ : ndarray of shape (n_features,)
             Variation of each feature over all samples.
 
-        sum_squares : ndarray of shape (n_features,)
+        sum_squares_ : ndarray of shape (n_features,)
             Sum of squares for each feature over all samples.
 
-        standard_deviation : ndarray of shape (n_features,)
+        standard_deviation_ : ndarray of shape (n_features,)
             Standard deviation of each feature over all samples.
 
-        sum_squares_centered : ndarray of shape (n_features,)
+        sum_squares_centered_ : ndarray of shape (n_features,)
             Centered sum of squares for each feature over all samples.
 
-        second_order_raw_moment : ndarray of shape (n_features,)
+        second_order_raw_moment_ : ndarray of shape (n_features,)
             Second order moment of each feature over all samples.
+
+    Notes
+    -----
+        Attributes are populated only for corresponding result options.
     """
 
-    def __init__(self, result_options="all"):
-        super().__init__(result_options, algorithm="by_default")
-        module = _backend.basic_statistics.compute
-        self._partial_result = module.partial_compute_result()
+    def __init__(self, result_options="all", algorithm="by_default"):
+        super().__init__(result_options, algorithm)
+        self._reset()
+        self._queue = None
+
+    @bind_default_backend("basic_statistics")
+    def partial_compute_result(self): ...
+
+    @bind_default_backend("basic_statistics")
+    def partial_compute(self, *args, **kwargs): ...
+
+    @bind_default_backend("basic_statistics")
+    def finalize_compute(self, *args, **kwargs): ...
 
     def _reset(self):
-        module = _backend.basic_statistics.compute
-        self._partial_result = module.partial_train_result()
+        self._need_to_finalize = False
+        self._outtype = None
+        self._queue = None
+        # get the _partial_result pointer from backend
+        self._partial_result = self.partial_compute_result()
 
-    def partial_fit(self, X, weights=None, queue=None):
-        """
-        Computes partial data for basic statistics
-        from data batch X and saves it to `_partial_result`.
+    def __getstate__(self):
+        # Since finalize_fit can't be dispatched without directly provided queue
+        # and the dispatching policy can't be serialized, the computation is finalized
+        # here and the policy is not saved in serialized data.
+        self.finalize_fit()
+        data = self.__dict__.copy()
+        data.pop("_queue", None)
+
+        return data
+
+    @supports_queue
+    def partial_fit(self, X, sample_weight=None, queue=None):
+        """Generate partial statistics from batch data in `_partial_result`.
 
         Parameters
         ----------
@@ -128,50 +111,55 @@ class IncrementalBasicStatistics(BaseBasicStatistics):
             Training data batch, where `n_samples` is the number of samples
             in the batch, and `n_features` is the number of features.
 
-        queue : dpctl.SyclQueue
-            If not None, use this queue for computations.
+        sample_weight : array-like of shape (n_samples,), default=None
+            Individual weights for each sample.
+
+        queue : SyclQueue or None, default=None
+            SYCL Queue object for device code execution. Default
+            value None causes computation on host.
 
         Returns
         -------
         self : object
             Returns the instance itself.
         """
-        if not hasattr(self, "_policy"):
-            self._policy = self._get_policy(queue, X)
+
+        self._queue = queue
+        if not self._outtype:
+            self._outtype = return_type_constructor(X)
+
+        X_table, sample_weight_table = to_table(X, sample_weight, queue=queue)
+
         if not hasattr(self, "_onedal_params"):
-            dtype = get_dtype(X)
-            self._onedal_params = self._get_onedal_params(dtype)
+            self._onedal_params = self._get_onedal_params(False, dtype=X_table.dtype)
 
-        X, weights = _convert_to_supported(self._policy, X, weights)
-        X_table, weights_table = to_table(X, weights)
-        self._partial_result = _backend.basic_statistics.compute.partial_compute(
-            self._policy,
-            self._onedal_params,
-            self._partial_result,
-            X_table,
-            weights_table,
+        self._partial_result = self.partial_compute(
+            self._onedal_params, self._partial_result, X_table, sample_weight_table
         )
 
-    def finalize_fit(self, queue=None):
-        """
-        Finalizes basic statistics computation and obtains result
-        attributes from the current `_partial_result`.
+        self._need_to_finalize = True
+        self._queue = queue
 
-        Parameters
-        ----------
-        queue : dpctl.SyclQueue
-            Not used here, added for API conformance
+    def finalize_fit(self):
+        """Finalize statistics from the current `_partial_result`.
 
         Returns
         -------
         self : object
             Returns the instance itself.
         """
-        result = _backend.basic_statistics.compute.finalize_compute(
-            self._policy, self._onedal_params, self._partial_result
-        )
-        options = self._get_result_options(self.options).split("|")
-        for opt in options:
-            setattr(self, opt, from_table(getattr(result, opt)).ravel())
+        if self._need_to_finalize:
+            with QM.manage_global_queue(self._queue):
+                result = self.finalize_compute(self._onedal_params, self._partial_result)
+
+            for opt in self.options:
+                setattr(
+                    self,
+                    opt + "_",
+                    from_table(getattr(result, opt), like=self._outtype)[0, :],
+                )
+
+            self._outtype = None
+            self._need_to_finalize = False
 
         return self

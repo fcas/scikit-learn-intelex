@@ -19,7 +19,8 @@
 #include "onedal/common.hpp"
 #include "onedal/version.hpp"
 
-#include <regex>
+#define NO_IMPORT_ARRAY // import_array called in table.cpp
+#include "onedal/datatypes/numpy/data_conversion.hpp"
 
 namespace py = pybind11;
 
@@ -50,30 +51,17 @@ auto get_onedal_result_options(const py::dict& params) {
     auto result_option = params["result_option"].cast<std::string>();
     result_option_id onedal_options;
 
-    try {
-        std::regex re("\\w+");
-        const std::sregex_iterator last{};
-        const std::sregex_iterator first( //
-            result_option.begin(),
-            result_option.end(),
-            re);
-
-        for (std::sregex_iterator it = first; it != last; ++it) {
-            std::smatch match = *it;
-            if (match.str() == "intercept") {
-                onedal_options = onedal_options | result_options::intercept;
-            }
-            else if (match.str() == "coefficients") {
-                onedal_options = onedal_options | result_options::coefficients;
-            }
-            else {
-                ONEDAL_PARAM_DISPATCH_THROW_INVALID_VALUE(result_option);
-            }
+    result_option_detail::for_each_result_option(result_option, [&](std::string_view option) {
+        if (option == "intercept") {
+            onedal_options = onedal_options | result_options::intercept;
         }
-    }
-    catch (std::regex_error& e) {
-        ONEDAL_PARAM_DISPATCH_THROW_INVALID_VALUE(result_option);
-    }
+        else if (option == "coefficients") {
+            onedal_options = onedal_options | result_options::coefficients;
+        }
+        else {
+            ONEDAL_PARAM_DISPATCH_THROW_INVALID_VALUE(result_option);
+        }
+    });
 
     return onedal_options;
 }
@@ -85,8 +73,15 @@ struct params2desc {
 
         const auto intercept = params["intercept"].cast<bool>();
 
-        auto desc = linear_regression::descriptor<Float, Method, Task>(intercept)
-            .set_result_options(get_onedal_result_options(params));
+#if defined(ONEDAL_VERSION) && ONEDAL_VERSION >= 20240600
+        const auto alpha = params["alpha"].cast<double>();
+        auto desc = linear_regression::descriptor<Float, Method, Task>(intercept, alpha)
+                        .set_result_options(get_onedal_result_options(params));
+#else
+        auto desc =
+            linear_regression::descriptor<Float, Method, Task>(intercept).set_result_options(
+                get_onedal_result_options(params));
+#endif // defined(ONEDAL_VERSION) && ONEDAL_VERSION >= 20240600
         return desc;
     }
 };
@@ -95,65 +90,65 @@ template <typename Policy, typename Task>
 void init_train_ops(py::module& m) {
 #if defined(ONEDAL_VERSION) && ONEDAL_VERSION >= 20240000
     using train_hyperparams_t = dal::linear_regression::detail::train_parameters<Task>;
-    m.def("train", [](
-        const Policy& policy,
-        const py::dict& params,
-        const train_hyperparams_t& hyperparams,
-        const table& data,
-        const table& responses) {
-            using namespace dal::linear_regression;
-            using input_t = train_input<Task>;
-            train_ops_with_hyperparams ops(
-                policy, input_t{ data, responses }, params2desc{}, hyperparams);
-            return fptype2t{ method2t{ Task{}, ops } }(params);
-        }
-    );
+    m.def("train",
+          [](const Policy& policy,
+             const py::dict& params,
+             const train_hyperparams_t& hyperparams,
+             const table& data,
+             const table& responses) {
+              using namespace dal::linear_regression;
+              using input_t = train_input<Task>;
+              train_ops_with_hyperparams ops(policy,
+                                             input_t{ data, responses },
+                                             params2desc{},
+                                             hyperparams);
+              return fptype2t{ method2t{ Task{}, ops } }(params);
+          });
 #endif // defined(ONEDAL_VERSION) && ONEDAL_VERSION >= 20240000
-    m.def("train", [](
-        const Policy& policy,
-        const py::dict& params,
-        const table& data,
-        const table& responses) {
-            using namespace dal::linear_regression;
-            using input_t = train_input<Task>;
-            train_ops ops(policy, input_t{ data, responses }, params2desc{});
-            return fptype2t{ method2t{ Task{}, ops } }(params);
-        }
-    );
+    m.def("train",
+          [](const Policy& policy,
+             const py::dict& params,
+             const table& data,
+             const table& responses) {
+              using namespace dal::linear_regression;
+              using input_t = train_input<Task>;
+              train_ops ops(policy, input_t{ data, responses }, params2desc{});
+              return fptype2t{ method2t{ Task{}, ops } }(params);
+          });
 };
 
 template <typename Policy, typename Task>
 void init_partial_train_ops(py::module& m) {
     using prev_result_t = dal::linear_regression::partial_train_result<Task>;
     using train_hyperparams_t = dal::linear_regression::detail::train_parameters<Task>;
-    m.def("partial_train", [](
-        const Policy& policy,
-        const py::dict& params,
-        const train_hyperparams_t& hyperparams,
-        const prev_result_t& prev,
-        const table& data,
-        const table& responses) {
-            using namespace dal::linear_regression;
-            using input_t = partial_train_input<Task>;
-            partial_train_ops_with_hyperparams ops(
-                policy, input_t{ prev, data, responses }, params2desc{}, hyperparams);
-            return fptype2t{ method2t{ Task{}, ops } }(params);
-        }
-    );
+    m.def("partial_train",
+          [](const Policy& policy,
+             const py::dict& params,
+             const train_hyperparams_t& hyperparams,
+             const prev_result_t& prev,
+             const table& data,
+             const table& responses) {
+              using namespace dal::linear_regression;
+              using input_t = partial_train_input<Task>;
+              partial_train_ops_with_hyperparams ops(policy,
+                                                     input_t{ prev, data, responses },
+                                                     params2desc{},
+                                                     hyperparams);
+              return fptype2t{ method2t{ Task{}, ops } }(params);
+          });
 
     using prev_result_t = dal::linear_regression::partial_train_result<Task>;
-    m.def("partial_train", [](
-        const Policy& policy,
-        const py::dict& params,
-        const prev_result_t& prev,
-        const table& data,
-        const table& responses) {
-            using namespace dal::linear_regression;
-            using input_t = partial_train_input<Task>;
-            partial_train_ops ops(policy, input_t{ prev, data, responses }, params2desc{});
-            return fptype2t{ method2t{ Task{}, ops } }(params);
-        }
-    );
+    m.def("partial_train",
+          [](const Policy& policy,
+             const py::dict& params,
+             const prev_result_t& prev,
+             const table& data,
+             const table& responses) {
+              using namespace dal::linear_regression;
+              using input_t = partial_train_input<Task>;
+              partial_train_ops ops(policy, input_t{ prev, data, responses }, params2desc{});
+              return fptype2t{ method2t{ Task{}, ops } }(params);
+          });
 };
 
 template <typename Policy, typename Task>
@@ -161,24 +156,19 @@ void init_finalize_train_ops(py::module& m) {
     using input_t = dal::linear_regression::partial_train_result<Task>;
     using train_hyperparams_t = dal::linear_regression::detail::train_parameters<Task>;
 
-    m.def("finalize_train", [](
-        const Policy& policy,
-        const py::dict& params,
-        const train_hyperparams_t& hyperparams,
-        const input_t& data) {
-            finalize_train_ops_with_hyperparams ops(policy, data, params2desc{}, hyperparams);
-            return fptype2t{ method2t{ Task{}, ops } }(params);
-        }
-    );
+    m.def("finalize_train",
+          [](const Policy& policy,
+             const py::dict& params,
+             const train_hyperparams_t& hyperparams,
+             const input_t& data) {
+              finalize_train_ops_with_hyperparams ops(policy, data, params2desc{}, hyperparams);
+              return fptype2t{ method2t{ Task{}, ops } }(params);
+          });
 
-    m.def("finalize_train", [](
-        const Policy& policy,
-        const py::dict& params,
-        const input_t& data) {
-            finalize_train_ops ops(policy, data, params2desc{});
-            return fptype2t{ method2t{ Task{}, ops } }(params);
-        }
-    );
+    m.def("finalize_train", [](const Policy& policy, const py::dict& params, const input_t& data) {
+        finalize_train_ops ops(policy, data, params2desc{});
+        return fptype2t{ method2t{ Task{}, ops } }(params);
+    });
 };
 
 template <typename Policy, typename Task>
@@ -234,7 +224,23 @@ void init_partial_train_result(py::module_& m) {
     py::class_<result_t>(m, "partial_train_result")
         .def(py::init())
         .DEF_ONEDAL_PY_PROPERTY(partial_xtx, result_t)
-        .DEF_ONEDAL_PY_PROPERTY(partial_xty, result_t);
+        .DEF_ONEDAL_PY_PROPERTY(partial_xty, result_t)
+        .def(py::pickle(
+            [](const result_t& res) {
+                return py::make_tuple(
+                    py::cast<py::object>(numpy::convert_to_pyobject(res.get_partial_xtx())),
+                    py::cast<py::object>(numpy::convert_to_pyobject(res.get_partial_xty())));
+            },
+            [](py::tuple t) {
+                if (t.size() != 2)
+                    throw std::runtime_error("Invalid state!");
+                result_t res;
+                if (py::cast<int>(t[0].attr("size")) != 0)
+                    res.set_partial_xtx(numpy::convert_to_table(t[0]));
+                if (py::cast<int>(t[1].attr("size")) != 0)
+                    res.set_partial_xty(numpy::convert_to_table(t[1]));
+                return res;
+            }));
 }
 
 template <typename Task>
@@ -254,20 +260,38 @@ void init_train_hyperparameters(py::module_& m) {
     using namespace dal::linear_regression::detail;
     using train_hyperparams_t = train_parameters<Task>;
 
-    auto cls = py::class_<train_hyperparams_t>(m, "train_hyperparameters")
-                   .def(py::init())
-                   .def("set_cpu_macro_block", [](train_hyperparams_t& self, int64_t cpu_macro_block) {
-                        self.set_cpu_macro_block(cpu_macro_block);
-                   })
-                   .def("set_gpu_macro_block", [](train_hyperparams_t& self, int64_t gpu_macro_block) {
-                        self.set_gpu_macro_block(gpu_macro_block);
-                   })
-                   .def("get_cpu_macro_block", [](const train_hyperparams_t& self) {
-                        return self.get_cpu_macro_block();
-                   })
-                   .def("get_gpu_macro_block", [](const train_hyperparams_t& self) {
-                        return self.get_gpu_macro_block();
-                   });
+    auto cls =
+        py::class_<train_hyperparams_t>(m, "train_hyperparameters")
+            .def(py::init())
+            .def("set_cpu_macro_block", &train_hyperparams_t::set_cpu_macro_block)
+#if defined(ONEDAL_VERSION) && ONEDAL_VERSION >= 20250500
+            .def("set_cpu_max_cols_batched", &train_hyperparams_t::set_cpu_max_cols_batched)
+            .def("set_cpu_small_rows_threshold", &train_hyperparams_t::set_cpu_small_rows_threshold)
+            .def("set_cpu_small_rows_max_cols_batched",
+                 &train_hyperparams_t::set_cpu_small_rows_max_cols_batched)
+#endif // defined(ONEDAL_VERSION) && ONEDAL_VERSION >= 20250500
+            .def("set_gpu_macro_block", &train_hyperparams_t::set_gpu_macro_block)
+            .def("get_cpu_macro_block",
+                 [](const train_hyperparams_t& self) {
+                     return self.get_cpu_macro_block();
+                 })
+#if defined(ONEDAL_VERSION) && ONEDAL_VERSION >= 20250500
+            .def("get_cpu_max_cols_batched",
+                 [](const train_hyperparams_t& self) {
+                     return self.get_cpu_max_cols_batched();
+                 })
+            .def("get_cpu_small_rows_threshold",
+                 [](const train_hyperparams_t& self) {
+                     return self.get_cpu_small_rows_threshold();
+                 })
+            .def("get_cpu_small_rows_max_cols_batched",
+                 [](const train_hyperparams_t& self) {
+                     return self.get_cpu_small_rows_max_cols_batched();
+                 })
+#endif // defined(ONEDAL_VERSION) && ONEDAL_VERSION >= 20250500
+            .def("get_gpu_macro_block", [](const train_hyperparams_t& self) {
+                return self.get_gpu_macro_block();
+            });
 }
 
 #endif // defined(ONEDAL_VERSION) && ONEDAL_VERSION >= 20240000
@@ -297,6 +321,7 @@ ONEDAL_PY_INIT_MODULE(linear_model) {
 #ifdef ONEDAL_DATA_PARALLEL_SPMD
     ONEDAL_PY_INSTANTIATE(init_train_ops, sub, policy_spmd, task_list);
     ONEDAL_PY_INSTANTIATE(init_infer_ops, sub, policy_spmd, task_list);
+    ONEDAL_PY_INSTANTIATE(init_finalize_train_ops, sub, policy_spmd, task_list);
 #else // ONEDAL_DATA_PARALLEL_SPMD
     ONEDAL_PY_INSTANTIATE(init_train_ops, sub, policy_list, task_list);
     ONEDAL_PY_INSTANTIATE(init_infer_ops, sub, policy_list, task_list);
@@ -310,7 +335,6 @@ ONEDAL_PY_INIT_MODULE(linear_model) {
     ONEDAL_PY_INSTANTIATE(init_train_hyperparameters, sub, task_list);
 #endif // defined(ONEDAL_VERSION) && ONEDAL_VERSION >= 20240000
 #endif // ONEDAL_DATA_PARALLEL_SPMD
-
 }
 
 ONEDAL_PY_TYPE2STR(dal::linear_regression::task::regression, "regression");

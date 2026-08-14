@@ -18,15 +18,10 @@
 
 from sklearn.base import RegressorMixin
 from sklearn.neighbors._regression import KNeighborsRegressor as BaseKNeighborsRegressor
-
-from .._device_offload import support_usm_ndarray
-from .._utils import sklearn_check_version
-from ._base import KNeighborsMixin, NeighborsBase
-
-if not sklearn_check_version("1.2"):
-    from sklearn.neighbors._base import _check_weights
-
 from sklearn.utils.validation import _deprecate_positional_args
+
+from ..utils.validation import check_feature_names
+from ._base import KNeighborsMixin, NeighborsBase
 
 
 class KNeighborsRegressor(KNeighborsMixin, RegressorMixin, NeighborsBase):
@@ -56,21 +51,16 @@ class KNeighborsRegressor(KNeighborsMixin, RegressorMixin, NeighborsBase):
             n_jobs=n_jobs,
             **kwargs,
         )
-        self.weights = (
-            weights if sklearn_check_version("1.0") else _check_weights(weights)
-        )
+        self.weights = weights
 
     def _more_tags(self):
         return BaseKNeighborsRegressor._more_tags(self)
 
-    @support_usm_ndarray()
     def fit(self, X, y):
         return NeighborsBase._fit(self, X, y)
 
-    @support_usm_ndarray()
     def predict(self, X):
-        if sklearn_check_version("1.0"):
-            self._check_feature_names(X, reset=False)
+        check_feature_names(self, X, reset=False)
         return BaseKNeighborsRegressor.predict(self, X)
 
     fit.__doc__ = BaseKNeighborsRegressor.fit.__doc__

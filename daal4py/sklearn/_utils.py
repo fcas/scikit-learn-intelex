@@ -18,22 +18,22 @@ import functools
 import os
 import sys
 import warnings
-from typing import Any, Callable, Tuple
+from typing import Any, Tuple
 
 import numpy as np
-from numpy.lib.recfunctions import require_fields
+import scipy.sparse as sp
 from sklearn import __version__ as sklearn_version
 
 from daal4py import _get__daal_link_version__ as dv
 
 DaalVersionTuple = Tuple[int, str, int]
 
+import logging
+
 try:
     from packaging.version import Version
 except ImportError:
     from distutils.version import LooseVersion as Version
-
-import logging
 
 try:
     from pandas import DataFrame
@@ -42,17 +42,6 @@ try:
     pandas_is_imported = True
 except (ImportError, ModuleNotFoundError):
     pandas_is_imported = False
-
-try:
-    from daal4py.oneapi import is_in_sycl_ctxt as is_in_ctx
-
-    ctx_imported = True
-except (ImportError, ModuleNotFoundError):
-    ctx_imported = False
-
-oneapi_is_available = "daal4py.oneapi" in sys.modules
-if oneapi_is_available:
-    from daal4py.oneapi import _get_device_name_sycl_ctxt
 
 
 def set_idp_sklearn_verbose():
@@ -106,15 +95,19 @@ def daal_check_version(
     return False
 
 
-@functools.lru_cache(maxsize=256, typed=False)
-def sklearn_check_version(ver):
-    if hasattr(Version(ver), "base_version"):
-        base_sklearn_version = Version(sklearn_version).base_version
-        res = bool(Version(base_sklearn_version) >= Version(ver))
+def _package_check_version(version_to_check, available_version):
+    if hasattr(Version(version_to_check), "base_version"):
+        base_package_version = Version(available_version).base_version
+        res = bool(Version(base_package_version) >= Version(version_to_check))
     else:
         # packaging module not available
-        res = bool(Version(sklearn_version) >= Version(ver))
+        res = bool(Version(available_version) >= Version(version_to_check))
     return res
+
+
+@functools.lru_cache(maxsize=256, typed=False)
+def sklearn_check_version(ver):
+    return _package_check_version(ver, sklearn_version)
 
 
 def parse_dtype(dt):
@@ -145,19 +138,7 @@ def make2d(X):
 
 def get_patch_message(s):
     if s == "daal":
-        message = "running accelerated version on "
-        if oneapi_is_available:
-            dev = _get_device_name_sycl_ctxt()
-            if dev == "cpu" or dev is None:
-                message += "CPU"
-            elif dev == "gpu":
-                message += "GPU"
-            else:
-                raise ValueError(
-                    f"Unexpected device name {dev}." " Supported types are cpu and gpu"
-                )
-        else:
-            message += "CPU"
+        message = "running accelerated version on CPU"
 
     elif s == "sklearn":
         message = "fallback to original Scikit-learn"
@@ -169,13 +150,6 @@ def get_patch_message(s):
             f" 'sklearn_after_daal', got {s}"
         )
     return message
-
-
-def is_in_sycl_ctxt():
-    if ctx_imported:
-        return is_in_ctx()
-    else:
-        return False
 
 
 def is_DataFrame(X):
@@ -200,25 +174,12 @@ def get_number_of_types(dataframe):
         return 1
 
 
-def check_tree_nodes(tree_nodes):
-    def convert_to_old_tree_nodes(tree_nodes):
-        # conversion from sklearn>=1.3 tree nodes format to previous format:
-        # removal of 'missing_go_to_left' field from node dtype
-        new_field = "missing_go_to_left"
-        new_dtype = tree_nodes.dtype
-        old_dtype = np.dtype(
-            [
-                (key, value[0])
-                for key, value in new_dtype.fields.items()
-                if key != new_field
-            ]
-        )
-        return require_fields(tree_nodes, old_dtype)
+def is_sparse(x):
+    return sp.issparse(x) or (is_DataFrame(x) and hasattr(x, "sparse"))
 
-    if sklearn_check_version("1.3"):
-        return tree_nodes
-    else:
-        return convert_to_old_tree_nodes(tree_nodes)
+
+def check_is_array_api(x: object) -> bool:
+    return not isinstance(x, np.ndarray) and hasattr(x, "__dlpack__")
 
 
 class PatchingConditionsChain:
@@ -257,7 +218,7 @@ class PatchingConditionsChain:
         else:
             self.logger.debug(
                 f"{self.scope_name}: debugging for the patch is enabled to track"
-                " the usage of Intel® oneAPI Data Analytics Library (oneDAL)"
+                " the usage of oneAPI Data Analytics Library (oneDAL)"
             )
             for message in self.messages:
                 self.logger.debug(

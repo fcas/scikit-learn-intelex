@@ -14,12 +14,14 @@
 # limitations under the License.
 # ===============================================================================
 
+import os
+
+os.environ["SCIPY_ARRAY_API"] = "1"
 from sklearnex import patch_sklearn
 
 patch_sklearn()
 
 import argparse
-import os
 import sys
 
 import pytest
@@ -35,23 +37,41 @@ if __name__ == "__main__":
         help="device name",
         choices=["none", "cpu", "gpu"],
     )
-    args = parser.parse_args()
+    args, extra_args = parser.parse_known_args()
 
-    os.chdir(os.path.dirname(sklearn.__file__))
+    # Normalize path casing for Windows py3.10 + pytest 8+ compatibility
+    sklearn_file_dir = os.path.realpath(os.path.dirname(sklearn.__file__))
+    os.chdir(sklearn_file_dir)
 
     if os.environ["SELECTED_TESTS"] == "all":
         os.environ["SELECTED_TESTS"] = ""
 
     pytest_args = (
-        "--verbose --pyargs --durations=100 --durations-min=0.01 "
+        f"--rootdir={sklearn_file_dir} "
         f'{os.environ["DESELECTED_TESTS"]} {os.environ["SELECTED_TESTS"]}'.split(" ")
     )
+
+    if rc := os.getenv("COVERAGE_RCFILE"):
+        pytest_args += (
+            "--cov=onedal",
+            "--cov=sklearnex",
+            "--cov-branch",
+            f"--cov-config={rc}",
+            "--cov-report=",
+        )
+    if json_file := os.getenv("JSON_REPORT_FILE"):
+        pytest_args += ["--json-report", f"--json-report-file={json_file}"]
+
     while "" in pytest_args:
         pytest_args.remove("")
+
+    if extra_args:
+        pytest_args += extra_args
 
     if args.device != "none":
         with sklearn.config_context(target_offload=args.device):
             return_code = pytest.main(pytest_args)
     else:
         return_code = pytest.main(pytest_args)
+
     sys.exit(int(return_code))

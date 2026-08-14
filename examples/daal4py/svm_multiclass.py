@@ -34,11 +34,12 @@ def main(readcsv=pd_read_csv):
     train_file = data_path / "svm_multi_class_train_dense.csv"
     train_data = readcsv(train_file, range(nFeatures))
     train_labels = readcsv(train_file, range(nFeatures, nFeatures + 1))
+    lin_kernel = d4p.kernel_function_linear()
 
     # Create and configure algorithm object
     algorithm = d4p.multi_class_classifier_training(
         nClasses=nClasses,
-        training=d4p.svm_training(method="thunder"),
+        training=d4p.svm_training(method="thunder", kernel=lin_kernel),
         prediction=d4p.svm_prediction(),
     )
 
@@ -56,7 +57,7 @@ def main(readcsv=pd_read_csv):
     # Create an algorithm object to predict multi-class SVM values
     algorithm = d4p.multi_class_classifier_prediction(
         nClasses,
-        training=d4p.svm_training(method="thunder"),
+        training=d4p.svm_training(method="thunder", kernel=lin_kernel),
         prediction=d4p.svm_prediction(),
     )
     # Pass data to prediction. Prediction result provides prediction
@@ -67,7 +68,7 @@ def main(readcsv=pd_read_csv):
 
 
 if __name__ == "__main__":
-    (pred_res, pred_labels) = main()
+    pred_res, pred_labels = main()
     print(
         "\nSVM classification results (first 20 observations):\n",
         pred_res.prediction[0:20],

@@ -18,7 +18,7 @@
 # The code generator.
 # We define jinja2 templates to generate code for all the oneDAL algorithms and their
 # Result and Model objects. Most macros work on one namespace and expect expect
-# values/variables in their env. If not specificied otherwise, we assume we can
+# values/variables in their env. If not specified otherwise, we assume we can
 # use the following
 #          {{ns}}:            current C++ namespace
 #          {{algo}}:          algo name (as seen in API)
@@ -136,6 +136,8 @@ cdef extern from "daal4py.h":
     cdef object make_nda(list_NumericTablePtr * nt_ptr) except +
     cdef object make_nda(dict_NumericTablePtr * nt_ptr, void *) except +
     cdef NumericTablePtr make_nt(PyObject * nda) except +
+    cdef object make_nt_capsule_for_testing(PyObject * nda, bool legacy) except +
+    cdef object roundtrip_nt_for_testing(PyObject * nda) except +
     cdef list_NumericTablePtr make_datacoll(PyObject * nda) except +
     cdef dict_NumericTablePtr make_dnt(PyObject * nda, void *) except +
 
@@ -164,23 +166,106 @@ cdef extern from "daal4py_cpp.h":
     cdef void c_enable_thread_pinning(bool enabled) except +
 
 
-def daalinit(nthreads = -1):
+def daalinit(nthreads: int = -1) -> None:
+    '''
+    Set number of threads for daal4py
+
+    This modifies the number of threads configured for daal4py, which is a
+    global setting - meaning: it is applied to all subsequent calls to daal4py
+    functions / methods in the Python process.
+
+    By default, if not otherwise configured, it will use the full number of threads
+    available in the system.
+
+    :param int nthreads: [default: -1] Number of threads to use for further computations in daal4py. If this number is less or equal than zero, then settings will not be changed.
+
+    :rtype: None
+    '''
     c_daalinit(nthreads)
 
-def daalfini():
+def daalfini() -> None:
+    '''
+    Finalize MPI environment
+
+    When using distributed mode without ``mpi4py``, this function must be called after
+    the distributed computation calls before accessing the result object from the algorithm
+    that was executed in distributed mode. It has no effect when the python process is not
+    run through MPI (used for distributed mode).
+
+    This is a wrapper over ``MPI_Finalize``. It does not need to be called if ``mpi4py``
+    was imported before, as ``mpi4py`` calls this function upon process exit.
+
+    Note that software ``mpi4py`` calls this function automatically if it is imported, but
+    it only does so upon process exit, so this still needs to be called before accessing
+    the result objects in the process/rank that will use them.
+
+    :rtype: None
+    '''
     c_daalfini()
 
-def num_threads():
+def num_threads() -> int:
+    '''
+    Gets number of threads configured for daal4py.
+
+    .. note:: The number of threads for daal4py is a global setting, which can be changed through :obj:`daalinit`.
+
+    :rtype: int
+    '''
     return c_num_threads()
 
-def num_procs():
+def num_procs() -> int:
+    '''
+    Get number of MPI processes (in distributed mode)
+
+    If the python process is not run though MPI, this function will always return 1.
+
+    This is a wrapper over ``MPI_Comm_size``. Equivalent to :obj:`mpi4py.MPI.Comm.Get_size`,
+    but does not require ``mpi4py`` to be installed.
+
+    :rtype: int
+    '''
     return c_num_procs()
 
-def my_procid():
+def my_procid() -> int:
+    '''
+    Get MPI process rank
+
+    If the python process is not being run through MPI (used for distributed mode), this
+    will always return zero.
+
+    This is a wrapper over ``MPI_Comm_rank``. Equivalent to :obj:`mpi4py.MPI.Comm.Get_rank`,
+    but does not require ``mpi4py`` to be installed.
+
+    :rtype: int
+    '''
     return c_my_procid()
 
-def enable_thread_pinning(enabled=True):
+def enable_thread_pinning(enabled: bool = True) -> None:
+    '''
+    Enable or disable thread pinning
+
+    This function enables or disables binding of the threads that are used to parallelize
+    algorithms of the library to physical processing units for
+    possible performance improvement. Improper use of the method can
+    result in degradation of the application performance depending on
+    the system (machine) topology, application, and operating system.
+    By default, pinning is disabled.
+
+    .. note:: This is a global setting for daal4py.
+
+    :param bool enabled: [default: True] Whether to enable thread pinning or not.
+
+    :rtype: None
+    '''
     c_enable_thread_pinning(enabled)
+
+def _make_nt_capsule_for_testing(obj, legacy=False):
+    return make_nt_capsule_for_testing(<PyObject*>obj, legacy)
+
+
+def _roundtrip_nt_for_testing(obj):
+    return roundtrip_nt_for_testing(<PyObject*>obj)
+
 
 def get_data(x):
     if isinstance(x, pdDataFrame):
@@ -274,36 +359,6 @@ def daal_tsne_gradient_descent(init, p, size_iter, params, results, dtype=0):
                             data_or_file(<PyObject*>size_iter),
                             data_or_file(<PyObject*>params),
                             data_or_file(<PyObject*>results), dtype)
-
-
-def _execute_with_context(func):
-    def exec_func(*args, **keyArgs):
-        if 'daal4py.oneapi' in sys.modules:
-            import daal4py.oneapi as d4p_oneapi
-            devname = d4p_oneapi._get_device_name_sycl_ctxt()
-            ctxparams = d4p_oneapi._get_sycl_ctxt_params()
-
-            if devname == 'gpu' and ctxparams.get('host_offload_on_fail', False):
-                import logging
-                classname = func.__qualname__.split('.')[0]
-                try:
-                    res = func(*args, **keyArgs)
-                    logging.info(f"{classname} successfully run on gpu")
-                    return res
-                except RuntimeError as e:
-                    logging.info(f"{classname} failed to run on gpu. Fallback to host")
-                    gpu_ctx = d4p_oneapi._get_sycl_ctxt()
-                    host_ctx = d4p_oneapi.sycl_execution_context('host')
-                    try:
-                        host_ctx.apply()
-                        res = func(*args, **keyArgs)
-                    finally:
-                        del host_ctx
-                        gpu_ctx.apply()
-                    return res
-
-        return func(*args, **keyArgs)
-    return exec_func
 """
 
 ###############################################################################
@@ -404,7 +459,7 @@ cdef class {{flatname}}:
     def __init__(self, int64_t ptr=0):
         self.c_ptr = <{{class_type|flat}}>ptr
 
-    def __str__(self):
+    def __repr__(self):
         return _str(self, [{% for m in enum_gets+named_gets %}'{{m[1]}}',{% endfor %}])
 {% for m in enum_gets+named_gets %}
 {% set rtype = m[2]|d2cy(False) if m in enum_gets else m[0]|d2cy(False) %}
@@ -666,9 +721,7 @@ auto {{algo}}_obj = {{algo}}_type{{ctor}};
 """
 
 # macro to generate the body of a compute function (batch and distributed)
-gen_compute_macro = (
-    gen_inst_algo
-    + """
+gen_compute_macro = gen_inst_algo + """
 {% macro gen_compute(ns, input_args, params_req, params_opt, suffix="",
                      step_spec=None, tonative=True, iomtype=None, setupmode=False) %}
 {% set iom = iomtype if iomtype else "iom"+suffix+"_type" %}
@@ -780,7 +833,6 @@ gen_compute_macro = (
     }
 {%- endmacro %}
 """
-)
 
 # generates the de-templetized *__iface__ struct with providing generic compute(...)
 algo_iface_template = """
@@ -810,10 +862,7 @@ struct {{algo}}__iface__ : public {{prnt}}
 """
 
 # generates "manager" class for managing distributed and batch modes of a given algo
-manager_wrapper_template = (
-    gen_typedefs_macro
-    + gen_compute_macro
-    + """
+manager_wrapper_template = gen_typedefs_macro + gen_compute_macro + """
 {% if template_decl|length == template_args|length %}
 // The type used in cython
 typedef {{algo}}__iface__  c_{{algo}}_manager__iface__;
@@ -995,7 +1044,6 @@ public:
 
 };
 """
-)
 
 # generates cython class wrappers for given algo
 # also generates defs for __iface__ class
@@ -1037,6 +1085,7 @@ cdef class {{algo}}{{'('+iface[0]|lower+'__iface__)' if iface[0] else ''}}:
     {{algo}}
     {{params_all|fmt('{}', 'sphinx', sep='\n')|indent(4)}}
     '''
+    cdef tuple _params
     # Init simply forwards to the C++ construction function
     def __cinit__(self,
                   {{params_all|fmt('{}', 'decl_dflt_cy', sep=',\n')|indent(18)}}):
@@ -1047,6 +1096,17 @@ cdef class {{algo}}{{'('+iface[0]|lower+'__iface__)' if iface[0] else ''}}:
         self.c_ptr = mk_{{algo}}(
             {{params_all|fmt('{}', 'arg_cyext', sep=',\n')|indent(25+(algo|length))}}
         )
+        current_locals = locals()
+        ordered_input_args = '''
+            {{params_all|fmt('{}', 'name', sep=' ')|indent(0)}}
+        '''.strip().split()
+        self._params = tuple(
+            current_locals[arg]
+            for arg in ordered_input_args
+        )
+
+    def __reduce__(self):
+        return (self.__class__, self._params)
 
 {% if not iface[0] %}
     # the C++ manager__iface__ (de-templatized)
@@ -1057,7 +1117,6 @@ cdef class {{algo}}{{'('+iface[0]|lower+'__iface__)' if iface[0] else ''}}:
 
 {% set cytype = result_map.class_type.replace('Ptr', '')|d2cy(False)|lower %}
     # compute simply forwards to the C++ de-templatized manager__iface__::compute
-    @_execute_with_context
     def _compute(self,
                  {{input_args|fmt('{}', 'decl_dflt_cy', sep=',\n')|indent(17)}},
                  setup=False):
@@ -1308,7 +1367,7 @@ cpp_footer_template = """
 ##################################################################################
 def flat(t, cpp=True):
     """Flatten C++ name, leaving only what's needed to disambiguate names.
-    E.g. stripping of leading namespaces and replaceing :: with _
+    E.g. stripping of leading namespaces and replacing :: with _
     """
 
     def _flat(ty):
@@ -1541,7 +1600,19 @@ class wrapper_gen(object):
             t = jenv.from_string(algo_wrapper_template)
             cpp_end += t.render(**jparams) + "\n"
 
+        for k, v in self.get_adhoc_doc_replacements().items():
+            pyx_end = pyx_end.replace(k, v)
+
         return (cpp_map, cpp_begin, cpp_end, pyx_map, pyx_begin, pyx_end, typesstr)
+
+    def get_adhoc_doc_replacements(self) -> dict[str, str]:
+        return {
+            "64 bit integer flag that indicates the results to compute": 'Type of results to compute or to evaluate. Can pass one of ``"computeClassLabels"``,'
+            ' ``"computeClassProbabilities"``, ``"computeClassLogProbabilities"``; or more than one by'
+            ' joining them with separator bars (e.g. ``"computeClassLabels|computeClassProbabilities"``).'
+            " Note that not all of these are supported on every class/method accepting this argument"
+            " (see docs for oneDAL for details on what this specific class/method supports)."
+        }
 
     ##################################################################################
     def gen_footers(

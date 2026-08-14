@@ -16,41 +16,47 @@
 # limitations under the License.
 # ==============================================================================
 
-import distutils.command.build as orig_build
 import glob
 
 # System imports
 import os
 import pathlib
 import platform as plt
+import re
 import shutil
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
-from distutils.sysconfig import get_config_vars
+from ctypes.util import find_library
 from os.path import join as jp
+from sysconfig import get_config_vars
 
 import numpy as np
+import setuptools.command.build as orig_build
 import setuptools.command.develop as orig_develop
 from Cython.Build import cythonize
 from setuptools import Extension, setup
-from setuptools.command.build_ext import build_ext as _build_ext
 
 import scripts.build_backend as build_backend
 from scripts.package_helpers import get_packages_with_tests
-from scripts.version import get_onedal_version
+from scripts.version import get_onedal_shared_libs, get_onedal_version
 
-try:
-    from ctypes.utils import find_library
-except ImportError:
-    from ctypes.util import find_library
+
+def check_for_build_arg(arg: str) -> bool:
+    if arg in sys.argv:
+        sys.argv = [elt for elt in sys.argv if elt != arg]
+        return True
+    return False
+
+
+USE_ABS_RPATH: bool = check_for_build_arg("--abs-rpath")
+DEBUG_BUILD: bool = check_for_build_arg("--debug")
+USING_LLD: bool = check_for_build_arg("--using-lld")
 
 IS_WIN = False
 IS_MAC = False
 IS_LIN = False
 
 dal_root = os.environ.get("DALROOT")
-n_threads = int(os.environ.get("NTHREADS", os.cpu_count() or 1))
 
 arch_dir = plt.machine()
 plt_dict = {"x86_64": "intel64", "AMD64": "intel64", "aarch64": "arm"}
@@ -74,28 +80,39 @@ ONEDAL_MAJOR_BINARY_VERSION, ONEDAL_MINOR_BINARY_VERSION = get_onedal_version(
     dal_root, "binary"
 )
 ONEDAL_VERSION = get_onedal_version(dal_root)
-ONEDAL_2021_3 = 2021 * 10000 + 3 * 100
-ONEDAL_2023_0_1 = 2023 * 10000 + 0 * 100 + 1
-is_onedal_iface = (
-    os.environ.get("OFF_ONEDAL_IFACE", "0") == "0" and ONEDAL_VERSION >= ONEDAL_2021_3
-)
+if ONEDAL_VERSION < 20210300:
+    raise ValueError(
+        "OneDAL version is too old. Please use a more recent version (>= 2021.4)."
+    )
 
-d4p_version = (
-    os.environ["DAAL4PY_VERSION"]
-    if "DAAL4PY_VERSION" in os.environ
+sklearnex_version = (
+    os.environ["SKLEARNEX_VERSION"]
+    if "SKLEARNEX_VERSION" in os.environ
     else time.strftime("%Y%m%d.%H%M%S")
 )
 
 trues = ["true", "True", "TRUE", "1", "t", "T", "y", "Y", "Yes", "yes", "YES"]
 no_dist = True if "NO_DIST" in os.environ and os.environ["NO_DIST"] in trues else False
+no_dpc = True if "NO_DPC" in os.environ and os.environ["NO_DPC"] in trues else False
 no_stream = "NO_STREAM" in os.environ and os.environ["NO_STREAM"] in trues
+use_gcov = "SKLEARNEX_GCOV" in os.environ and os.environ["SKLEARNEX_GCOV"] in trues
 debug_build = os.getenv("DEBUG_BUILD") == "1"
-mpi_root = None if no_dist else os.environ["MPIROOT"]
-dpcpp = shutil.which("icpx") is not None and not (IS_WIN and debug_build)
+mpi_root = None if no_dist else os.environ.get("MPIROOT", os.environ.get("I_MPI_ROOT"))
+if (not no_dist) and (mpi_root is None):
+    raise ValueError(
+        "'MPIROOT' is not set, cannot build with distributed mode."
+        " Use 'NO_DIST=1' to build without distributed mode."
+    )
+dpcpp = (
+    shutil.which("icpx" if not IS_WIN else "icx") is not None
+    and "onedal_dpc" in get_onedal_shared_libs(dal_root, IS_WIN)
+    and not no_dpc
+    and not (IS_WIN and debug_build)
+)
 
 use_parameters_lib = (not IS_WIN) and (ONEDAL_VERSION >= 20240000)
 
-build_distribute = dpcpp and not no_dist and IS_LIN
+build_distributed = dpcpp and not no_dist and IS_LIN
 
 daal_lib_dir = lib_dir if (IS_MAC or os.path.isdir(lib_dir)) else os.path.dirname(lib_dir)
 ONEDAL_LIBDIRS = [daal_lib_dir]
@@ -150,10 +167,13 @@ def get_sdl_cflags():
 
 def get_sdl_ldflags():
     if IS_LIN:
-        return [
-            "-Wl,-z,noexecstack,-z,relro,-z,now,-fstack-protector-strong,"
-            "-fno-strict-overflow,-fno-delete-null-pointer-checks,-fwrapv"
-        ]
+        if not USING_LLD:
+            return [
+                "-Wl,-z,noexecstack,-z,relro,-z,now,-fstack-protector-strong,"
+                "-fno-strict-overflow,-fno-delete-null-pointer-checks,-fwrapv"
+            ]
+        else:
+            return ["-Wl,-z,noexecstack,-z,relro,-z,now"]
     if IS_MAC:
         return [
             "-fstack-protector-strong",
@@ -251,17 +271,24 @@ def get_build_options():
     # FIXME it is a wrong place for this dependency
     if not no_dist:
         include_dir_plat.append(mpi_root + "/include")
-    using_intel = os.environ.get("cc", "") in [
-        "icc",
-        "icpc",
-        "icl",
-        "dpcpp",
-        "icx",
-        "icpx",
-    ]
+
+    using_intel = any(
+        [
+            intel_exec in os.environ.get("CXX", "")
+            for intel_exec in [
+                "icc",
+                "icpc",
+                "icl",
+                "dpcpp",
+                "icx",
+                "icpx",
+            ]
+        ]
+    )
+
     eca = [
         "-DPY_ARRAY_UNIQUE_SYMBOL=daal4py_array_API",
-        '-DD4P_VERSION="' + d4p_version + '"',
+        '-DD4P_VERSION="' + sklearnex_version + '"',
         "-DNPY_ALLOW_THREADS=1",
     ]
     ela = []
@@ -283,6 +310,9 @@ def get_build_options():
     eca += get_sdl_cflags()
     ela += get_sdl_ldflags()
 
+    if DEBUG_BUILD and not IS_WIN:
+        eca += ["-g"]
+
     if IS_MAC:
         eca.append("-stdlib=libc++")
         ela.append("-stdlib=libc++")
@@ -290,14 +320,20 @@ def get_build_options():
         ela.append("-Wl,-rpath,@loader_path/../../../")
     elif IS_WIN:
         ela.append("-IGNORE:4197")
-    elif IS_LIN and not any(
-        x in os.environ and "-g" in os.environ[x]
-        for x in ["CPPFLAGS", "CFLAGS", "LDFLAGS"]
-    ):
-        ela.append("-s")
     if IS_LIN:
         ela.append("-fPIC")
-        ela.append("-Wl,-rpath,$ORIGIN/../../../")
+        ela.append(
+            f"-Wl,-rpath,{(daal_lib_dir + ':') if USE_ABS_RPATH else ''}$ORIGIN/../../../"
+        )
+        if (
+            not any(
+                x in os.environ and "-g" in os.environ[x]
+                for x in ["CPPFLAGS", "CFLAGS", "CXXFLAGS", "CC", "CXX", "LDFLAGS"]
+            )
+            and not USE_ABS_RPATH
+            and not DEBUG_BUILD
+        ):
+            ela.append("-s")
     return eca, ela, include_dir_plat
 
 
@@ -324,30 +360,8 @@ def getpyexts():
         library_dirs=ONEDAL_LIBDIRS,
         language="c++",
     )
-    exts.extend(cythonize(ext, nthreads=n_threads))
 
-    if dpcpp:
-        if IS_LIN or IS_MAC:
-            runtime_oneapi_dirs = ["$ORIGIN/oneapi"]
-        elif IS_WIN:
-            runtime_oneapi_dirs = []
-
-        ext = Extension(
-            "daal4py._oneapi",
-            [
-                os.path.abspath("src/oneapi/oneapi.pyx"),
-            ],
-            depends=["src/oneapi/oneapi.h", "src/oneapi/oneapi_backend.h"],
-            include_dirs=include_dir_plat + [np.get_include()],
-            extra_compile_args=eca,
-            extra_link_args=ela,
-            define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
-            libraries=["oneapi_backend"] + libraries_plat,
-            library_dirs=["daal4py/oneapi"] + ONEDAL_LIBDIRS,
-            runtime_library_dirs=runtime_oneapi_dirs,
-            language="c++",
-        )
-        exts.extend(cythonize(ext, nthreads=n_threads))
+    exts.extend(cythonize(ext))
 
     if not no_dist:
         mpi_include_dir = include_dir_plat + [np.get_include()] + MPI_INCDIRS
@@ -398,92 +412,79 @@ def gen_pyx(odir):
     odir = os.path.abspath(odir)
     if not os.path.isdir(odir):
         os.mkdir(odir)
-    gen_daal4py(dal_root, odir, d4p_version, no_dist=no_dist, no_stream=no_stream)
+    gen_daal4py(dal_root, odir, sklearnex_version, no_dist=no_dist, no_stream=no_stream)
 
 
 gen_pyx(os.path.abspath("./build"))
 
 
-def build_oneapi_backend():
-    eca, ela, includes = get_build_options()
-    cc = "icx"
-    if IS_WIN:
-        cxx = "icx"
-    else:
-        cxx = "icpx"
-    eca = ["-fsycl"] + ["-fsycl-device-code-split=per_kernel"] + eca
-    ela = ["-fsycl"] + ["-fsycl-device-code-split=per_kernel"] + ela
-
-    return build_backend.build_cpp(
-        cc=cc,
-        cxx=cxx,
-        sources=["src/oneapi/oneapi_backend.cpp"],
-        targetname="oneapi_backend",
-        targetprefix="" if IS_WIN else "lib",
-        targetsuffix=".dll" if IS_WIN else ".so",
-        libs=get_libs("daal") + ["OpenCL", "onedal_sycl"],
-        libdirs=ONEDAL_LIBDIRS,
-        includes=includes,
-        eca=eca,
-        ela=ela,
-        defines=[],
-        installpath="daal4py/oneapi/",
-    )
-
-
 def get_onedal_py_libs():
     ext_suffix = get_config_vars("EXT_SUFFIX")[0]
     libs = [f"_onedal_py_host{ext_suffix}", f"_onedal_py_dpc{ext_suffix}"]
-    if build_distribute:
+    if build_distributed:
         libs += [f"_onedal_py_spmd_dpc{ext_suffix}"]
     if IS_WIN:
         ext_suffix_lib = ext_suffix.replace(".dll", ".lib")
         libs += [f"_onedal_py_host{ext_suffix_lib}", f"_onedal_py_dpc{ext_suffix_lib}"]
-        if build_distribute:
+        if build_distributed:
             libs += [f"_onedal_py_spmd_dpc{ext_suffix_lib}"]
     return libs
 
 
-class parallel_build_ext(_build_ext):
-    def build_extensions(self):
-        with ThreadPoolExecutor(max_workers=n_threads) as executor:
-            result_list = [
-                executor.submit(self.build_extension, ext) for ext in self.extensions
-            ]
-        assert all(
-            f.exception() is None for f in result_list
-        ), "There were errors building the extensions"
+class onedal_build:
 
-
-class custom_build:
     def run(self):
-        if is_onedal_iface:
-            cxx = os.getenv("CXX", "cl" if IS_WIN else "g++")
-            build_backend.custom_build_cmake_clib(
-                iface="host",
-                cxx=cxx,
-                onedal_major_binary_version=ONEDAL_MAJOR_BINARY_VERSION,
-                no_dist=no_dist,
-                use_parameters_lib=use_parameters_lib,
-            )
-        if dpcpp:
-            build_oneapi_backend()
-            if is_onedal_iface:
-                build_backend.custom_build_cmake_clib(
-                    iface="dpc",
-                    onedal_major_binary_version=ONEDAL_MAJOR_BINARY_VERSION,
-                    no_dist=no_dist,
-                    use_parameters_lib=use_parameters_lib,
-                )
-                if build_distribute:
-                    build_backend.custom_build_cmake_clib(
-                        iface="spmd_dpc",
-                        onedal_major_binary_version=ONEDAL_MAJOR_BINARY_VERSION,
-                        no_dist=no_dist,
-                        use_parameters_lib=use_parameters_lib,
-                    )
+        self.onedal_run()
+        super(onedal_build, self).run()
+        self.onedal_post_build()
+        if hasattr(self, "build_lib"):
+            # swap out __version__ before install
+            for p in ["onedal", "sklearnex"]:
+                loc = os.sep.join((self.build_lib, p, "__init__.py"))
+                if os.path.isfile(loc):
+                    with open(loc, "r+") as f:
+                        data = f.read().replace("2199.9.9", sklearnex_version)
+                        f.seek(0)
+                        f.write(data)
+                        f.truncate()
 
-    def post_build(self):
+    def onedal_run(self):
+        n_threads = self.parallel
+        makeflags = os.getenv("MAKEFLAGS", "")
+        # True is used by setuptools to indicate cpu_count for `parallel`
+        # None is default for setuptools for single threading
+        # take the last defined value in MAKEFLAGS, as it will be the one
+        # used by cmake/make. Do regex in reverse to deal with missing values
+        # and last values simultaneously in a simple fashion
+        regex_inv = r"(?<!\S)\d*(?=j-(?!\S))|$"
+        orig_n_threads = re.findall(regex_inv, makeflags[::-1])[0][::-1]
+
+        if n_threads is None:
+            n_threads = int(orig_n_threads) if orig_n_threads else os.cpu_count() or 1
+        elif n_threads is True:
+            n_threads = os.cpu_count() or 1
+
+        build_onedal = lambda iface: build_backend.custom_build_cmake_clib(
+            iface=iface,
+            onedal_major_binary_version=ONEDAL_MAJOR_BINARY_VERSION,
+            mpi_root=mpi_root,
+            no_dist=no_dist,
+            use_parameters_lib=use_parameters_lib,
+            use_abs_rpath=USE_ABS_RPATH,
+            use_gcov=use_gcov,
+            n_threads=n_threads,
+            is_win=IS_WIN,
+            is_lin=IS_LIN,
+            debug_build=DEBUG_BUILD,
+            using_lld=USING_LLD,
+        )
+        build_onedal("host")
+        if dpcpp:
+            build_onedal("dpc")
+            if build_distributed:
+                build_onedal("spmd_dpc")
+
+    def onedal_post_build(self):
         if IS_MAC:
             import subprocess
 
@@ -492,38 +493,20 @@ class custom_build:
             major_is_available = (
                 find_library(f"libonedal_core.{major_version}.dylib") is not None
             )
-            if major_is_available and ONEDAL_VERSION == ONEDAL_2023_0_1:
-                extension_libs = list(pathlib.Path(".").glob("**/*darwin.so"))
-                onedal_libs = ["onedal", "onedal_dpc", "onedal_core", "onedal_thread"]
-                for ext_lib in extension_libs:
-                    for onedal_lib in onedal_libs:
-                        subprocess.call(
-                            "/usr/bin/install_name_tool -change "
-                            f"lib{onedal_lib}.dylib "
-                            f"lib{onedal_lib}.{major_version}.dylib "
-                            f"{ext_lib}".split(" "),
-                            shell=False,
-                        )
 
 
-class develop(orig_develop.develop, custom_build):
-    def run(self):
-        custom_build.run(self)
-        super().run()
-        custom_build.post_build(self)
+class develop(onedal_build, orig_develop.develop):
+    parallel = None
 
 
-class build(orig_build.build, custom_build):
-    def run(self):
-        custom_build.run(self)
-        super().run()
-        custom_build.post_build(self)
+class build(onedal_build, orig_build.build):
+    pass
 
 
 project_urls = {
-    "Bug Tracker": "https://github.com/intel/scikit-learn-intelex",
-    "Documentation": "https://intelpython.github.io/daal4py/",
-    "Source Code": "https://github.com/intel/scikit-learn-intelex/daal4py",
+    "Bug Tracker": "https://github.com/uxlfoundation/scikit-learn-intelex/issues",
+    "Documentation": "https://uxlfoundation.github.io/scikit-learn-intelex/",
+    "Source Code": "https://github.com/uxlfoundation/scikit-learn-intelex",
 }
 
 with open("README.md", "r", encoding="utf8") as f:
@@ -531,18 +514,14 @@ with open("README.md", "r", encoding="utf8") as f:
 
 packages_with_tests = [
     "daal4py",
-    "daal4py.oneapi",
     "daal4py.mb",
     "daal4py.sklearn",
-    "daal4py.sklearn.cluster",
-    "daal4py.sklearn.decomposition",
     "daal4py.sklearn.ensemble",
     "daal4py.sklearn.linear_model",
     "daal4py.sklearn.manifold",
     "daal4py.sklearn.metrics",
     "daal4py.sklearn.neighbors",
     "daal4py.sklearn.monkeypatch",
-    "daal4py.sklearn.svm",
     "daal4py.sklearn.utils",
     "daal4py.sklearn.model_selection",
     "onedal",
@@ -550,11 +529,32 @@ packages_with_tests = [
     "onedal.covariance",
     "onedal.datatypes",
     "onedal.decomposition",
+    "onedal.dummy",
     "onedal.ensemble",
     "onedal.neighbors",
     "onedal.primitives",
     "onedal.svm",
     "onedal.utils",
+    "sklearnex",
+    "sklearnex.basic_statistics",
+    "sklearnex.cluster",
+    "sklearnex.covariance",
+    "sklearnex.decomposition",
+    "sklearnex.dummy",
+    "sklearnex.ensemble",
+    "sklearnex.glob",
+    "sklearnex.linear_model",
+    "sklearnex.manifold",
+    "sklearnex.metrics",
+    "sklearnex.model_selection",
+    "sklearnex.neighbors",
+    "sklearnex.preview",
+    "sklearnex.preview.covariance",
+    "sklearnex.preview.decomposition",
+    "sklearnex.preview.linear_model",
+    "sklearnex.preview.preprocessing",
+    "sklearnex.svm",
+    "sklearnex.utils",
 ]
 
 if ONEDAL_VERSION >= 20230100:
@@ -563,35 +563,47 @@ if ONEDAL_VERSION >= 20230100:
 if ONEDAL_VERSION >= 20230200:
     packages_with_tests += ["onedal.cluster"]
 
-if build_distribute:
+if build_distributed:
     packages_with_tests += [
         "onedal.spmd",
         "onedal.spmd.covariance",
         "onedal.spmd.decomposition",
         "onedal.spmd.ensemble",
+        "sklearnex.spmd",
+        "sklearnex.spmd.covariance",
+        "sklearnex.spmd.decomposition",
+        "sklearnex.spmd.ensemble",
     ]
     if ONEDAL_VERSION >= 20230100:
         packages_with_tests += [
             "onedal.spmd.basic_statistics",
             "onedal.spmd.linear_model",
             "onedal.spmd.neighbors",
+            "sklearnex.spmd.basic_statistics",
+            "sklearnex.spmd.linear_model",
+            "sklearnex.spmd.neighbors",
         ]
     if ONEDAL_VERSION >= 20230200:
-        packages_with_tests += ["onedal.spmd.cluster"]
+        packages_with_tests += [
+            "onedal.spmd.cluster",
+            "sklearnex.spmd.cluster",
+            "sklearnex.spmd.preprocessing",
+        ]
 
 setup(
-    name="daal4py",
-    description="A convenient Python API to Intel(R) oneAPI Data Analytics Library",
+    name="scikit-learn-intelex",
+    description="Extension for scikit-learn is a "
+    "seamless way to speed up your scikit-learn application.",
     long_description=long_description,
     long_description_content_type="text/markdown",
     license="Apache-2.0",
     author="Intel Corporation",
-    version=d4p_version,
-    url="https://github.com/intel/scikit-learn-intelex",
+    version=sklearnex_version,
+    url="https://github.com/uxlfoundation/scikit-learn-intelex",
     author_email="onedal.maintainers@intel.com",
     maintainer_email="onedal.maintainers@intel.com",
     project_urls=project_urls,
-    cmdclass={"develop": develop, "build": build, "build_ext": parallel_build_ext},
+    cmdclass={"develop": develop, "build": build},
     classifiers=[
         "Development Status :: 5 - Production/Stable",
         "Environment :: Console",
@@ -602,29 +614,25 @@ setup(
         "Operating System :: Microsoft :: Windows",
         "Operating System :: POSIX :: Linux",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
         "Topic :: Scientific/Engineering",
         "Topic :: System",
         "Topic :: Software Development",
     ],
-    python_requires=">=3.8",
+    python_requires=">=3.10",
     install_requires=[
-        "scikit-learn>=1.0",
-        "numpy>=1.19.5 ; python_version <= '3.9'",
-        "numpy>=1.21.6 ; python_version == '3.10'",
+        "scikit-learn>=1.6",
+        "numpy>=1.21.6 ; python_version <= '3.10'",
         "numpy>=1.23.5 ; python_version >= '3.11'",
+        "packaging",
     ],
     keywords=["machine learning", "scikit-learn", "data science", "data analytics"],
     packages=get_packages_with_tests(packages_with_tests),
     package_data={
-        "daal4py.oneapi": [
-            "liboneapi_backend.so",
-            "oneapi_backend.lib",
-            "oneapi_backend.dll",
-        ],
         "onedal": get_onedal_py_libs(),
     },
     ext_modules=getpyexts(),

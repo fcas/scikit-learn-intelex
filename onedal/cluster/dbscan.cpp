@@ -19,8 +19,6 @@
 #include "onedal/common.hpp"
 #include "onedal/version.hpp"
 
-#include <regex>
-
 namespace py = pybind11;
 
 namespace oneapi::dal::python {
@@ -49,35 +47,23 @@ auto get_onedal_result_options(const py::dict& params) {
     auto result_options = params["result_options"].cast<std::string>();
     result_option_id onedal_options;
 
-    try {
-        std::regex re("\\w+");
-        const std::sregex_iterator last{};
-        const std::sregex_iterator first( //
-            result_options.begin(),
-            result_options.end(),
-            re);
-
-        for (std::sregex_iterator it = first; it != last; ++it) {
-            std::smatch match = *it;
-            if (match.str() == "responses") {
-                onedal_options = onedal_options | result_options::responses;
-            }
-            else if (match.str() == "core_observation_indices") {
-                onedal_options = onedal_options | result_options::core_observation_indices;
-            }
-            else if (match.str() == "core_observations") {
-                onedal_options = onedal_options | result_options::core_observations;
-            }
-            else if (match.str() == "core_flags") {
-                onedal_options = onedal_options | result_options::core_flags;
-            }
-            else
-                ONEDAL_PARAM_DISPATCH_THROW_INVALID_VALUE(result_options);
+    result_option_detail::for_each_result_option(result_options, [&](std::string_view option) {
+        if (option == "responses") {
+            onedal_options = onedal_options | result_options::responses;
         }
-    }
-    catch (std::regex_error& e) {
-        ONEDAL_PARAM_DISPATCH_THROW_INVALID_VALUE(result_options);
-    }
+        else if (option == "core_observation_indices") {
+            onedal_options = onedal_options | result_options::core_observation_indices;
+        }
+        else if (option == "core_observations") {
+            onedal_options = onedal_options | result_options::core_observations;
+        }
+        else if (option == "core_flags") {
+            onedal_options = onedal_options | result_options::core_flags;
+        }
+        else {
+            ONEDAL_PARAM_DISPATCH_THROW_INVALID_VALUE(result_options);
+        }
+    });
 
     return onedal_options;
 }
@@ -99,17 +85,15 @@ struct params2desc {
 
 template <typename Policy, typename Task>
 void init_compute_ops(py::module_& m) {
-    m.def("compute",
-          [](const Policy& policy,
-             const py::dict& params,
-             const table& data,
-             const table& weights) {
-              using namespace dbscan;
-              using input_t = compute_input<Task>;
+    m.def(
+        "compute",
+        [](const Policy& policy, const py::dict& params, const table& data, const table& weights) {
+            using namespace dbscan;
+            using input_t = compute_input<Task>;
 
-              compute_ops ops(policy, input_t{ data, weights }, params2desc{});
-              return fptype2t{ method2t{ Task{}, ops } }(params);
-          });
+            compute_ops ops(policy, input_t{ data, weights }, params2desc{});
+            return fptype2t{ method2t{ Task{}, ops } }(params);
+        });
 }
 
 template <typename Task>
@@ -133,7 +117,7 @@ ONEDAL_PY_DECLARE_INSTANTIATOR(init_compute_ops);
 ONEDAL_PY_DECLARE_INSTANTIATOR(init_compute_result);
 
 // TODO:
-// change the name of modue for all algos -> cluster.
+// change the name of module for all algos -> cluster.
 ONEDAL_PY_INIT_MODULE(dbscan) {
     using namespace dal::detail;
     using namespace dbscan;
@@ -148,7 +132,6 @@ ONEDAL_PY_INIT_MODULE(dbscan) {
     ONEDAL_PY_INSTANTIATE(init_compute_ops, sub, policy_list, task_list);
     ONEDAL_PY_INSTANTIATE(init_compute_result, sub, task_list);
 #endif // ONEDAL_DATA_PARALLEL_SPMD
-
 }
 
 } // namespace oneapi::dal::python

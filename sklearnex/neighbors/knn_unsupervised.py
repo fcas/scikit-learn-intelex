@@ -14,22 +14,34 @@
 # limitations under the License.
 # ===============================================================================
 
-from sklearn.neighbors._unsupervised import NearestNeighbors as sklearn_NearestNeighbors
+from sklearn.neighbors._unsupervised import NearestNeighbors as _sklearn_NearestNeighbors
+from sklearn.utils._array_api import get_namespace
 from sklearn.utils.validation import _deprecate_positional_args, check_is_fitted
 
 from daal4py.sklearn._n_jobs_support import control_n_jobs
 from daal4py.sklearn._utils import sklearn_check_version
+from daal4py.sklearn.utils.validation import get_requires_y_tag
+from onedal._device_offload import _transfer_to_host
 from onedal.neighbors import NearestNeighbors as onedal_NearestNeighbors
+from onedal.utils._array_api import _is_numpy_namespace
 
 from .._device_offload import dispatch, wrap_output_data
+from ..utils._array_api import enable_array_api
+from ..utils.validation import validate_data
 from .common import KNeighborsDispatchingBase
 
+if sklearn_check_version("1.9"):
+    from sklearn.utils._array_api import check_same_namespace, get_namespace_and_device
 
-@control_n_jobs(decorated_methods=["fit", "kneighbors"])
-class NearestNeighbors(sklearn_NearestNeighbors, KNeighborsDispatchingBase):
-    __doc__ = sklearn_NearestNeighbors.__doc__
-    if sklearn_check_version("1.2"):
-        _parameter_constraints: dict = {**sklearn_NearestNeighbors._parameter_constraints}
+
+@enable_array_api
+@control_n_jobs(decorated_methods=["fit", "kneighbors", "radius_neighbors"])
+class NearestNeighbors(KNeighborsDispatchingBase, _sklearn_NearestNeighbors):
+    __doc__ = _sklearn_NearestNeighbors.__doc__
+    # Default onedal estimator class - SPMD subclasses can override this
+    _onedal_estimator = onedal_NearestNeighbors
+
+    _parameter_constraints: dict = {**_sklearn_NearestNeighbors._parameter_constraints}
 
     @_deprecate_positional_args
     def __init__(
@@ -55,82 +67,180 @@ class NearestNeighbors(sklearn_NearestNeighbors, KNeighborsDispatchingBase):
         )
 
     def fit(self, X, y=None):
+        if sklearn_check_version("1.9"):
+            xp, is_array_api, device = get_namespace_and_device(X)
+        else:
+            xp, is_array_api = get_namespace(X)
+            device = getattr(X, "device", None)
+
         dispatch(
             self,
             "fit",
             {
                 "onedal": self.__class__._onedal_fit,
-                "sklearn": sklearn_NearestNeighbors.fit,
+                "sklearn": _sklearn_NearestNeighbors.fit,
             },
             X,
             None,
         )
+        # Ensure _fit_X matches the input namespace so that
+        # kneighbors(X=None) can use get_namespace(self._fit_X).
+        if is_array_api and not _is_numpy_namespace(xp):
+            self._fit_X = xp.asarray(self._fit_X, device=device)
         return self
 
     @wrap_output_data
     def kneighbors(self, X=None, n_neighbors=None, return_distance=True):
+        if n_neighbors is not None:
+            self._validate_n_neighbors(n_neighbors)
+
         check_is_fitted(self)
-        if sklearn_check_version("1.0") and X is not None:
-            self._check_feature_names(X, reset=False)
+
+        self._kneighbors_validation(X, n_neighbors)
+
         return dispatch(
             self,
             "kneighbors",
             {
                 "onedal": self.__class__._onedal_kneighbors,
-                "sklearn": sklearn_NearestNeighbors.kneighbors,
+                "sklearn": _sklearn_NearestNeighbors.kneighbors,
             },
             X,
             n_neighbors=n_neighbors,
             return_distance=return_distance,
         )
 
-    @wrap_output_data
+    # radius_neighbors always falls back to sklearn on CPU and returns
+    # ragged object-dtype arrays that cannot be converted to array API
+    # or GPU formats, so @wrap_output_data is intentionally omitted.
     def radius_neighbors(
         self, X=None, radius=None, return_distance=True, sort_results=False
     ):
-        _onedal_estimator = getattr(self, "_onedal_estimator", None)
-
         if (
-            _onedal_estimator is not None
+            hasattr(self, "_onedal_estimator")
             or getattr(self, "_tree", 0) is None
             and self._fit_method == "kd_tree"
         ):
-            sklearn_NearestNeighbors.fit(self, self._fit_X, getattr(self, "_y", None))
-        result = sklearn_NearestNeighbors.radius_neighbors(
-            self, X, radius, return_distance, sort_results
+            # _fit_X may be on a non-host device (e.g. torch XPU, dpnp GPU)
+            # after Array API fit(). Transfer to host for sklearn refit.
+            _, (fit_X_host,) = _transfer_to_host(self._fit_X)
+            _sklearn_NearestNeighbors.fit(self, fit_X_host, getattr(self, "_y", None))
+        check_is_fitted(self)
+        return dispatch(
+            self,
+            "radius_neighbors",
+            {
+                "onedal": None,
+                "sklearn": _sklearn_NearestNeighbors.radius_neighbors,
+            },
+            X,
+            radius=radius,
+            return_distance=return_distance,
+            sort_results=sort_results,
         )
 
-        return result
+    def radius_neighbors_graph(
+        self, X=None, radius=None, mode="connectivity", sort_results=False
+    ):
+        return dispatch(
+            self,
+            "radius_neighbors_graph",
+            {
+                "onedal": None,
+                "sklearn": _sklearn_NearestNeighbors.radius_neighbors_graph,
+            },
+            X,
+            radius=radius,
+            mode=mode,
+            sort_results=sort_results,
+        )
 
     def _onedal_fit(self, X, y=None, queue=None):
+        xp, _ = get_namespace(X)
+        self._set_effective_metric()
+
+        X = validate_data(
+            self,
+            X,
+            dtype=[xp.float64, xp.float32],
+            accept_sparse="csr",
+        )
+
         onedal_params = {
             "n_neighbors": self.n_neighbors,
             "algorithm": self.algorithm,
             "metric": self.effective_metric_,
-            "p": self.effective_metric_params_["p"],
+            "p": self.effective_metric_params_.get("p", 2),
         }
 
-        try:
-            requires_y = self._get_tags()["requires_y"]
-        except KeyError:
-            requires_y = False
-
-        self._onedal_estimator = onedal_NearestNeighbors(**onedal_params)
-        self._onedal_estimator.requires_y = requires_y
+        if hasattr(self.__class__, "_onedal_estimator"):
+            self._onedal_estimator = self.__class__._onedal_estimator(**onedal_params)
+        else:
+            self._onedal_estimator = onedal_NearestNeighbors(**onedal_params)
+        self._onedal_estimator.requires_y = get_requires_y_tag(self)
         self._onedal_estimator.effective_metric_ = self.effective_metric_
         self._onedal_estimator.effective_metric_params_ = self.effective_metric_params_
         self._onedal_estimator.fit(X, y, queue=queue)
-
         self._save_attributes()
 
     def _onedal_predict(self, X, queue=None):
+        if X is not None:
+            xp, _ = get_namespace(X)
+            X = validate_data(
+                self,
+                X,
+                dtype=[xp.float64, xp.float32],
+                accept_sparse="csr",
+                reset=False,
+                force_all_finite=False,
+            )
+            if sklearn_check_version("1.9"):
+                check_same_namespace(X, self, attribute="_fit_X", method="predict")
         return self._onedal_estimator.predict(X, queue=queue)
 
     def _onedal_kneighbors(
         self, X=None, n_neighbors=None, return_distance=True, queue=None
     ):
-        return self._onedal_estimator.kneighbors(
-            X, n_neighbors, return_distance, queue=queue
+        # Determine if query is the training data
+        if X is not None:
+            query_is_train = False
+            xp, _ = get_namespace(X)
+            X = validate_data(
+                self,
+                X,
+                dtype=[xp.float64, xp.float32],
+                accept_sparse="csr",
+                reset=False,
+            )
+            if sklearn_check_version("1.9"):
+                check_same_namespace(X, self, attribute="_fit_X", method="kneighbors")
+        else:
+            query_is_train = True
+            X = self._fit_X
+
+        # Resolve effective n_neighbors (adjust for self-exclusion)
+        effective_n_neighbors = (
+            n_neighbors if n_neighbors is not None else self.n_neighbors
+        )
+        if query_is_train:
+            effective_n_neighbors += 1
+
+        # Validate bounds with adjusted n_neighbors
+        self._validate_kneighbors_bounds(effective_n_neighbors, query_is_train, X)
+
+        # Always get both distances and indices for post-processing
+        # Pass n_neighbors as keyword to avoid _transfer_to_host mixing
+        # USM array X with int n_neighbors in the same positional args tuple
+        distances, indices = self._onedal_estimator.kneighbors(
+            X, n_neighbors=effective_n_neighbors, return_distance=True, queue=queue
+        )
+
+        return self._kneighbors_postprocess(
+            distances,
+            indices,
+            n_neighbors if n_neighbors is not None else self.n_neighbors,
+            return_distance,
+            query_is_train,
         )
 
     def _save_attributes(self):
@@ -141,6 +251,9 @@ class NearestNeighbors(sklearn_NearestNeighbors, KNeighborsDispatchingBase):
         self._fit_method = self._onedal_estimator._fit_method
         self._tree = self._onedal_estimator._tree
 
-    fit.__doc__ = sklearn_NearestNeighbors.__doc__
-    kneighbors.__doc__ = sklearn_NearestNeighbors.kneighbors.__doc__
-    radius_neighbors.__doc__ = sklearn_NearestNeighbors.radius_neighbors.__doc__
+    fit.__doc__ = _sklearn_NearestNeighbors.__doc__
+    kneighbors.__doc__ = _sklearn_NearestNeighbors.kneighbors.__doc__
+    radius_neighbors.__doc__ = _sklearn_NearestNeighbors.radius_neighbors.__doc__
+    radius_neighbors_graph.__doc__ = (
+        _sklearn_NearestNeighbors.radius_neighbors_graph.__doc__
+    )

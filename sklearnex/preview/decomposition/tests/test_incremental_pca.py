@@ -14,17 +14,41 @@
 # limitations under the License.
 # ===============================================================================
 
-import numpy as np
-import pytest
-from numpy.testing import assert_allclose
+from contextlib import nullcontext
 
-from daal4py.sklearn._utils import daal_check_version
+import array_api_strict
+import numpy as np
+import pandas as pd
+import polars as pl
+import pytest
+import scipy.sparse as sp
+from numpy.testing import assert_allclose
+from sklearn.base import clone
+from sklearn.datasets import load_iris
+
+from daal4py.sklearn._utils import (
+    _package_check_version,
+    daal_check_version,
+    sklearn_check_version,
+)
+from onedal import _dpc_backend
 from onedal.tests.utils._dataframes_support import (
     _as_numpy,
     _convert_to_dataframe,
+    dpnp_available,
     get_dataframes_and_queues,
+    torch_available,
+    torch_xpu_available,
 )
+from onedal.tests.utils._device_selection import is_sycl_device_available
+from sklearnex import config_context
 from sklearnex.preview.decomposition import IncrementalPCA
+from sklearnex.tests.utils import assert_transform_output_matches_default
+
+if dpnp_available:
+    import dpnp
+if torch_available:
+    import torch
 
 
 @pytest.mark.parametrize("dataframe,queue", get_dataframes_and_queues())
@@ -264,3 +288,251 @@ def test_sklearnex_partial_fit_on_random_data(
     X_df = _convert_to_dataframe(X, sycl_queue=queue, target_df=dataframe)
     transformed_data = incpca.transform(X_df)
     check_pca(incpca, dtype, whiten, X, transformed_data)
+
+
+@pytest.mark.parametrize("dataframe,queue", get_dataframes_and_queues())
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_sklearnex_incremental_estimatior_pickle(dataframe, queue, dtype):
+    import pickle
+
+    incpca = IncrementalPCA()
+
+    # Check that estimator can be serialized without any data.
+    dump = pickle.dumps(incpca)
+    incpca_loaded = pickle.loads(dump)
+
+    seed = 77
+    gen = np.random.default_rng(seed)
+    X = gen.uniform(low=-0.3, high=+0.7, size=(10, 10))
+    X = X.astype(dtype)
+    X_split = np.array_split(X, 2)
+    X_split_df = _convert_to_dataframe(X_split[0], sycl_queue=queue, target_df=dataframe)
+    incpca.partial_fit(X_split_df)
+    incpca_loaded.partial_fit(X_split_df)
+    dump = pickle.dumps(incpca_loaded)
+    incpca_loaded = pickle.loads(dump)
+    assert incpca.batch_size == incpca_loaded.batch_size
+    assert incpca.n_features_in_ == incpca_loaded.n_features_in_
+    assert incpca.n_samples_seen_ == incpca_loaded.n_samples_seen_
+    if hasattr(incpca, "_parameter_constraints"):
+        assert incpca._parameter_constraints == incpca_loaded._parameter_constraints
+    assert incpca.n_jobs == incpca_loaded.n_jobs
+    X_split_df = _convert_to_dataframe(X_split[1], sycl_queue=queue, target_df=dataframe)
+    incpca.partial_fit(X_split_df)
+    incpca_loaded.partial_fit(X_split_df)
+
+    # Check that estimator can be serialized after partial_fit call.
+    dump = pickle.dumps(incpca)
+    incpca_loaded = pickle.loads(dump)
+
+    assert_allclose(incpca.singular_values_, incpca_loaded.singular_values_, atol=1e-6)
+    assert_allclose(incpca.n_samples_seen_, incpca_loaded.n_samples_seen_, atol=1e-6)
+    assert_allclose(incpca.n_features_in_, incpca_loaded.n_features_in_, atol=1e-6)
+    assert_allclose(incpca.mean_, incpca_loaded.mean_, atol=1e-6)
+    assert_allclose(incpca.var_, incpca_loaded.var_, atol=1e-6)
+    assert_allclose(
+        incpca.explained_variance_, incpca_loaded.explained_variance_, atol=1e-6
+    )
+    assert_allclose(incpca.components_, incpca_loaded.components_, atol=1e-6)
+    assert_allclose(
+        incpca.explained_variance_ratio_,
+        incpca_loaded.explained_variance_ratio_,
+        atol=1e-6,
+    )
+
+    # Check that finalized estimator can be serialized.
+    dump = pickle.dumps(incpca_loaded)
+    incpca_loaded = pickle.loads(dump)
+
+    assert_allclose(incpca.singular_values_, incpca_loaded.singular_values_, atol=1e-6)
+    assert_allclose(incpca.n_samples_seen_, incpca_loaded.n_samples_seen_, atol=1e-6)
+    assert_allclose(incpca.n_features_in_, incpca_loaded.n_features_in_, atol=1e-6)
+    assert_allclose(incpca.mean_, incpca_loaded.mean_, atol=1e-6)
+    assert_allclose(incpca.var_, incpca_loaded.var_, atol=1e-6)
+    assert_allclose(
+        incpca.explained_variance_, incpca_loaded.explained_variance_, atol=1e-6
+    )
+    assert_allclose(incpca.components_, incpca_loaded.components_, atol=1e-6)
+    assert_allclose(
+        incpca.explained_variance_ratio_,
+        incpca_loaded.explained_variance_ratio_,
+        atol=1e-6,
+    )
+
+
+@pytest.mark.parametrize("dataframe,queue", get_dataframes_and_queues("numpy"))
+def test_changed_estimated_attributes(with_array_api, dataframe, queue):
+    # check that attributes necessary for the PCA onedal estimator match
+    # changes occurring in the sklearnex estimator
+    X, y = load_iris(return_X_y=True)
+
+    X_0 = _convert_to_dataframe(X[y == 0], sycl_queue=queue, target_df=dataframe)
+    X = _convert_to_dataframe(X, sycl_queue=queue, target_df=dataframe)
+
+    est0 = IncrementalPCA(n_components=4).fit(X_0)
+    est = clone(est0)
+    assert not hasattr(est, "_onedal_estimator")
+    est.fit(X)
+    assert not np.array_equal(_as_numpy(est.transform(X)), _as_numpy(est0.transform(X)))
+
+    # copy over parameters necessary for transform
+    est.mean_ = est0.mean_
+    est.components_ = est0.components_
+    est.explained_variance_ = est0.explained_variance_
+    est.n_components_ = est0.n_components_  # is trivial but exercises the logic
+
+    assert np.array_equal(_as_numpy(est.transform(X)), _as_numpy(est0.transform(X)))
+
+
+@pytest.mark.allow_sklearn_fallback
+def test_create_model_behavior():
+    # verify that fit fallbacks does not break ``transform`` as the oneDAL
+    # model is generated JIT
+
+    X, _ = load_iris(return_X_y=True)
+    # generate a onedal estimator
+    est = IncrementalPCA(n_components=3)
+    X_trans = est.fit_transform(X)
+
+    # force data to sparse for a fallback to sklearn
+    X_sp = sp.csr_matrix(X)
+    est.fit(X_sp)
+    # In the case of a fallback, the model should be set to none by clobbered
+    # fitted attributes
+    assert est._onedal_estimator._onedal_model is None
+
+    X_trans_sparse = est.transform(X)
+    # use allclose as data was fit with sklearn and onedal on the same data
+    # but using different backends
+    assert_allclose(X_trans, X_trans_sparse)
+
+
+@pytest.mark.skipif(
+    not _package_check_version("2.1", np.__version__),
+    reason="Array API requires more recent NumPy version",
+)
+@pytest.mark.skipif(not dpnp_available, reason="Functionality to test requires DPNP.")
+@pytest.mark.skipif(
+    not sklearn_check_version("1.9"),
+    reason="Relies on functionality introduced in later scikit-learn versions.",
+)
+@pytest.mark.skipif(
+    not is_sycl_device_available("gpu"), reason="Test for GPU-specific functionality."
+)
+def test_incpca_error_on_incompatible_devices(with_array_api):
+    import dpnp
+
+    rng = np.random.default_rng(seed=123)
+    X = rng.random(size=(20, 3), dtype=np.float32)
+    X_cpu = dpnp.array(X, device="cpu")
+    X_gpu = dpnp.array(X, device="gpu")
+
+    err_match = "device|queue"
+
+    model = IncrementalPCA(svd_solver="covariance_eigh").fit(X_gpu)
+    with pytest.raises(ValueError, match=err_match):
+        _ = model.partial_fit(X_cpu)
+    with pytest.raises(ValueError, match=err_match):
+        _ = model.transform(X_cpu)
+    with pytest.raises(ValueError, match=err_match):
+        _ = model.inverse_transform(X_cpu)
+
+    model.fit(X_cpu)
+    with pytest.raises(ValueError, match=err_match):
+        _ = model.partial_fit(X_gpu)
+    with pytest.raises(ValueError, match=err_match):
+        _ = model.transform(X_gpu)
+    with pytest.raises(ValueError, match=err_match):
+        _ = model.inverse_transform(X_gpu)
+
+
+def _incpca_convert(arr, xp, device):
+    """Convert a numpy array to the array-API backend ``xp`` on ``device``."""
+    if xp is np:
+        return arr
+    return xp.asarray(arr, device=device)
+
+
+# array_api_strict output conversion fails on numpy < 2.2.5: IncrementalPCA rebuilds
+# its model from the fitted ``components_``, which numpy < 2.2.5 returns as a read-only
+# array that ``to_table`` cannot export through DLPack (BufferError). numpy >= 2.2.5
+# returns a writeable array, so it works there.
+# TODO: remove this skip once sklearnex handles read-only arrays in the oneDAL data
+# conversion so array_api_strict works on numpy < 2.2.5 as well.
+_INCPCA_ARRAY_API_STRICT = pytest.param(
+    array_api_strict,
+    None,
+    marks=pytest.mark.skipif(
+        not _package_check_version("2.2.5", np.__version__),
+        reason="TODO: sklearnex read-only DLPack conversion fails on numpy<2.2.5",
+    ),
+)
+
+# (xp, device) array-API input combinations, CPU and GPU; device-specific entries
+# are dropped at collection time when the hardware/library is unavailable.
+# dpnp arrays are SYCL arrays even on "cpu", so they need a SYCL-enabled sklearnex
+# build (``_dpc_backend``) to be converted -- a CPU-only build raises "installation
+# does not have SYCL support". ``is_sycl_device_available`` is not enough: it uses a
+# dpctl queue that succeeds regardless of whether sklearnex was built with DPC.
+_INCPCA_ARRAY_API_INPUTS = (
+    [(np, None), _INCPCA_ARRAY_API_STRICT]
+    + ([(dpnp, "cpu")] if dpnp_available and _dpc_backend is not None else [])
+    + (
+        [(dpnp, "gpu")]
+        if dpnp_available and _dpc_backend is not None and is_sycl_device_available("gpu")
+        else []
+    )
+    + ([(torch, "cpu")] if torch_available else [])
+    + ([(torch, "xpu")] if torch_xpu_available else [])
+)
+
+
+@pytest.mark.parametrize("xp,device", _INCPCA_ARRAY_API_INPUTS)
+@pytest.mark.parametrize("transform_output", ["polars", "pandas"])
+@pytest.mark.parametrize("method", ["transform", "fit_transform"])
+def test_transform_output_matches_default(
+    xp, device, transform_output, method, with_array_api
+):
+    X = _incpca_convert(load_iris(return_X_y=True)[0], xp, device)
+    incpca = IncrementalPCA(n_components=3).fit(X)
+    assert_transform_output_matches_default(incpca, X, transform_output, method)
+
+
+@pytest.mark.skipif(not dpnp_available, reason="Functionality to test requires DPNP.")
+@pytest.mark.parametrize("dataframe,queue", get_dataframes_and_queues("dpnp"))
+@pytest.mark.parametrize("transform_output", ["polars", "pandas"])
+@pytest.mark.parametrize("method", ["transform", "fit_transform"])
+def test_transform_output_dpnp_no_array_api(dataframe, queue, transform_output, method):
+    X = _convert_to_dataframe(
+        load_iris(return_X_y=True)[0], sycl_queue=queue, target_df=dataframe
+    )
+    incpca = IncrementalPCA(n_components=3).fit(X)
+    assert_transform_output_matches_default(incpca, X, transform_output, method)
+
+
+@pytest.mark.skipif(
+    not is_sycl_device_available("gpu"), reason="Test for GPU-specific functionality."
+)
+@pytest.mark.parametrize("transform_output", ["polars", "pandas"])
+@pytest.mark.parametrize("method", ["transform", "fit_transform"])
+def test_transform_output_target_offload(transform_output, method):
+    X = load_iris(return_X_y=True)[0]
+    with config_context(target_offload="gpu"):
+        incpca = IncrementalPCA(n_components=3).fit(X)
+        assert_transform_output_matches_default(incpca, X, transform_output, method)
+
+
+@pytest.mark.parametrize("target_offload", [False, True])
+@pytest.mark.parametrize("dataframe", [pd.DataFrame, pl.DataFrame])
+@pytest.mark.parametrize("transform_output", ["polars", "pandas"])
+@pytest.mark.parametrize("method", ["transform", "fit_transform"])
+def test_transform_output_pandas_polars_input(
+    dataframe, target_offload, transform_output, method
+):
+    if target_offload and not is_sycl_device_available("gpu"):
+        pytest.skip("Test for GPU-specific functionality.")
+    X = dataframe(load_iris(return_X_y=True)[0])
+    ctx = config_context(target_offload="gpu") if target_offload else nullcontext()
+    with ctx:
+        incpca = IncrementalPCA(n_components=3).fit(X)
+        assert_transform_output_matches_default(incpca, X, transform_output, method)

@@ -18,18 +18,22 @@
 # Args:
 # 1 - device name (optional)
 
-ci_dir=$( dirname $( dirname "${BASH_SOURCE[0]}" ) )
+ci_dir=$( dirname $( dirname $( realpath "${BASH_SOURCE[0]}" ) ) )
 cd $ci_dir
 
 # selected tests might be set externally
 # ('all' - special value to run all tests)
 export SELECTED_TESTS=${SELECTED_TESTS:-$(python scripts/select_sklearn_tests.py)}
 
+export DESELECT_FLAGS="--public ${DESELECT_FLAGS}"
 if [ -n "${SKLEARNEX_PREVIEW}" ]; then
     export DESELECT_FLAGS="--preview ${DESELECT_FLAGS}"
 fi
-export DESELECTED_TESTS=$(python ../.circleci/deselect_tests.py ../deselected_tests.yaml ${DESELECT_FLAGS})
+if [ "$1" == "gpu" ]; then
+    export DESELECT_FLAGS="--gpu ${DESELECT_FLAGS}"
+fi
 
+export DESELECTED_TESTS=$(python ../.circleci/deselect_tests.py ../deselected_tests.yaml ${DESELECT_FLAGS})
 # manual setting of OCL_ICD_FILENAMES is required in
 # specific MSYS environment with conda packages downloaded from intel channel
 if [[ "$(uname)" =~ "MSYS" ]] && [ -z "${OCL_ICD_FILENAMES}" ] && [ -n "${CONDA_PREFIX}" ]; then
@@ -44,5 +48,5 @@ if [ -n "$(pip list | grep dpctl)" ]; then
     python -c "import dpctl; print(dpctl.get_devices())"
 fi
 
-python scripts/run_sklearn_tests.py -d ${1:-none}
+python scripts/run_sklearn_tests.py -d ${1:-none} -c $( dirname $ci_dir )/setup.cfg
 exit $?

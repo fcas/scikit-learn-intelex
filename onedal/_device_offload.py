@@ -15,81 +15,71 @@
 # ==============================================================================
 
 from functools import wraps
+from operator import xor
 
-try:
-    import dpnp
+import numpy as np
 
-    dpnp_available = True
-except ImportError:
-    dpnp_available = False
+from .datatypes import dlpack_to_numpy
+from .utils import _sycl_queue_manager as QM
 
-try:
-    from sklearnex._device_offload import (
-        _copy_to_usm,
-        _get_global_queue,
-        _transfer_to_host,
-    )
 
-    _sklearnex_available = True
-except ImportError:
-    import logging
+def supports_queue(func):
+    """Decorator that updates the global queue before function evaluation.
 
-    logging.warning("Device support requires " "Intel(R) Extension for Scikit-learn*.")
-    _sklearnex_available = False
+    The global queue is updated based on provided queue and global configuration.
+    If a ``queue`` keyword argument is provided in the decorated function, its
+    value will be used globally. If no queue is provided, the global queue will
+    be updated from the provided data. In either case, all data objects are
+    verified to be on the same device (or on host).
+
+    Parameters
+    ----------
+        func : callable
+            Function to be wrapped for SYCL queue use in oneDAL.
+
+    Returns
+    -------
+        wrapper : callable
+            Wrapped function.
+    """
+
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        queue = kwargs.get("queue", None)
+        with QM.manage_global_queue(queue, *args) as queue:
+            kwargs["queue"] = queue
+            result = func(self, *args, **kwargs)
+        return result
+
+    return wrapper
+
+
+def _transfer_to_host(*data):
+    has_usm_data = None
+
+    host_data = []
+    for item in data:
+        if item is None:
+            host_data.append(item)
+            continue
+
+        if usm_iface := hasattr(item, "__sycl_usm_array_interface__"):
+            xp = item.__array_namespace__()
+            item = xp.asnumpy(item)
+            has_usm_data = has_usm_data or has_usm_data is None
+        elif not isinstance(item, np.ndarray) and (hasattr(item, "__dlpack_device__")):
+            item = dlpack_to_numpy(item)
+
+        # set has_usm_data to boolean and use xor to see if they don't match
+        if xor((has_usm_data := bool(has_usm_data)), usm_iface):
+            raise RuntimeError("Input data shall be located on single target device")
+
+        host_data.append(item)
+    return has_usm_data, host_data
 
 
 def _get_host_inputs(*args, **kwargs):
-    q = _get_global_queue()
-    q, hostargs = _transfer_to_host(q, *args)
-    q, hostvalues = _transfer_to_host(q, *kwargs.values())
+    _, hostargs = _transfer_to_host(*args)
+    _, hostvalues = _transfer_to_host(*kwargs.values())
     hostkwargs = dict(zip(kwargs.keys(), hostvalues))
-    return q, hostargs, hostkwargs
-
-
-def _extract_usm_iface(*args, **kwargs):
-    allargs = (*args, *kwargs.values())
-    if len(allargs) == 0:
-        return None
-    return getattr(allargs[0], "__sycl_usm_array_interface__", None)
-
-
-def _run_on_device(func, obj=None, *args, **kwargs):
-    if obj is not None:
-        return func(obj, *args, **kwargs)
-    return func(*args, **kwargs)
-
-
-def support_usm_ndarray(freefunc=False):
-    def decorator(func):
-        def wrapper_impl(obj, *args, **kwargs):
-            if _sklearnex_available:
-                usm_iface = _extract_usm_iface(*args, **kwargs)
-                data_queue, hostargs, hostkwargs = _get_host_inputs(*args, **kwargs)
-                hostkwargs["queue"] = data_queue
-                result = _run_on_device(func, obj, *hostargs, **hostkwargs)
-                if usm_iface is not None and hasattr(result, "__array_interface__"):
-                    result = _copy_to_usm(data_queue, result)
-                    if (
-                        dpnp_available
-                        and len(args) > 0
-                        and isinstance(args[0], dpnp.ndarray)
-                    ):
-                        result = dpnp.array(result, copy=False)
-                return result
-            return _run_on_device(func, obj, *args, **kwargs)
-
-        if freefunc:
-
-            @wraps(func)
-            def wrapper_free(*args, **kwargs):
-                return wrapper_impl(None, *args, **kwargs)
-
-            return wrapper_free
-
-        @wraps(func)
-        def wrapper_with_self(self, *args, **kwargs):
-            return wrapper_impl(self, *args, **kwargs)
-
-        return wrapper_with_self
-
-    return decorator
+    return hostargs, hostkwargs

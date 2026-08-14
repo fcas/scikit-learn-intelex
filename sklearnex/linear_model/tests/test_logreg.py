@@ -14,17 +14,35 @@
 # limitations under the License.
 # ===============================================================================
 
+import os
+import warnings
+
+import numpy as np
 import pytest
-from sklearn.datasets import load_breast_cancer, load_iris
-from sklearn.metrics import accuracy_score
+from numpy.testing import assert_allclose
+from scipy.sparse import csr_matrix
+from sklearn.datasets import load_breast_cancer, load_iris, make_classification
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.linear_model import LogisticRegression as _sklearn_LogisticRegression
+from sklearn.metrics import accuracy_score, log_loss
 from sklearn.model_selection import train_test_split
 
-from daal4py.sklearn._utils import daal_check_version
+from daal4py.sklearn._utils import daal_check_version, sklearn_check_version
 from onedal.tests.utils._dataframes_support import (
     _as_numpy,
     _convert_to_dataframe,
+    dpnp_available,
     get_dataframes_and_queues,
+    get_queues,
+    torch_available,
 )
+from onedal.tests.utils._device_selection import is_sycl_device_available
+from sklearnex import config_context
+
+if dpnp_available:
+    import dpnp
+if torch_available:
+    import torch
 
 
 def prepare_input(X, y, dataframe, queue):
@@ -37,15 +55,18 @@ def prepare_input(X, y, dataframe, queue):
     return X_train, X_test, y_train, y_test
 
 
+def check_preview_is_enabled() -> bool:
+    return "SKLEARNEX_PREVIEW" in os.environ
+
+
 @pytest.mark.parametrize(
-    "dataframe,queue",
-    get_dataframes_and_queues(device_filter_="cpu"),
+    "dataframe,queue", get_dataframes_and_queues(device_filter_="cpu")
 )
 def test_sklearnex_multiclass_classification(dataframe, queue):
     from sklearnex.linear_model import LogisticRegression
 
     X, y = load_iris(return_X_y=True)
-    X_train, X_test, y_train, y_test = prepare_input(X, y, dataframe, queue)
+    X_train, X_test, y_train, y_test = prepare_input(X, y, dataframe, queue=queue)
 
     logreg = LogisticRegression(fit_intercept=True, solver="lbfgs", max_iter=200).fit(
         X_train, y_train
@@ -65,14 +86,18 @@ def test_sklearnex_multiclass_classification(dataframe, queue):
     get_dataframes_and_queues(),
 )
 def test_sklearnex_binary_classification(dataframe, queue):
+    if (not queue or queue.sycl_device.is_cpu) and not check_preview_is_enabled():
+        pytest.skip("Functionality in preview")
     from sklearnex.linear_model import LogisticRegression
 
     X, y = load_breast_cancer(return_X_y=True)
-    X_train, X_test, y_train, y_test = prepare_input(X, y, dataframe, queue)
+    X_train, X_test, y_train, y_test = prepare_input(X, y, dataframe, queue=queue)
 
-    logreg = LogisticRegression(fit_intercept=True, solver="newton-cg", max_iter=100).fit(
-        X_train, y_train
-    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=ConvergenceWarning)
+        logreg = LogisticRegression(
+            fit_intercept=True, solver="newton-cg", max_iter=100
+        ).fit(X_train, y_train)
 
     if daal_check_version((2024, "P", 1)):
         assert "sklearnex" in logreg.__module__
@@ -89,3 +114,732 @@ def test_sklearnex_binary_classification(dataframe, queue):
 
     y_pred = _as_numpy(logreg.predict(X_test))
     assert accuracy_score(y_test, y_pred) > 0.95
+
+
+if daal_check_version((2024, "P", 700)):
+
+    @pytest.mark.parametrize("queue", get_queues("gpu"))
+    @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+    @pytest.mark.parametrize(
+        "dims", [(3007, 17, 0.05), (50000, 100, 0.01), (512, 10, 0.5)]
+    )
+    @pytest.mark.allow_sklearn_fallback
+    def test_csr(queue, dtype, dims):
+        from sklearnex.linear_model import LogisticRegression
+
+        n, p, density = dims
+
+        # Create sparse dataset for classification
+        X, y = make_classification(n, p, random_state=42)
+        X = X.astype(dtype)
+        y = y.astype(dtype)
+        np.random.seed(2007 + n + p)
+        mask = np.random.binomial(1, density, (n, p))
+        X = X * mask
+        X_sp = csr_matrix(X)
+
+        model = LogisticRegression(fit_intercept=True, solver="newton-cg")
+        model_sp = LogisticRegression(fit_intercept=True, solver="newton-cg")
+
+        with config_context(target_offload="gpu:0"):
+            model.fit(X, y)
+            pred = model.predict(X)
+            prob = model.predict_proba(X)
+            raw = model.decision_function(X)
+            model_sp.fit(X_sp, y)
+            pred_sp = model_sp.predict(X_sp)
+            prob_sp = model_sp.predict_proba(X_sp)
+            raw_sp = model.decision_function(X_sp)
+
+        rtol = 2e-4
+        assert_allclose(pred, pred_sp, rtol=rtol)
+        assert_allclose(prob, prob_sp, rtol=rtol)
+        assert_allclose(raw, raw_sp, rtol=rtol)
+        assert_allclose(model.coef_, model_sp.coef_, rtol=rtol)
+        assert_allclose(model.intercept_, model_sp.intercept_, rtol=rtol)
+
+
+# Note: this is adapted from a test in scikit-learn:
+# https://github.com/scikit-learn/scikit-learn/blob/9b7a86fb6d45905eec7b7afd01d3ae32643c8180/sklearn/linear_model/tests/test_logistic.py#L1494
+# Here we don't always expect them to match exactly due to differences in numerical precision
+# and how each library deals with large/small numbers, but oftentimes the results from oneDAL
+# end up being better in terms of resulting function values (for the objective function being
+# minimized), hence this test will try to look at function values if coefficients aren't
+# sufficiently similar.
+def test_logistic_regression_is_correct():
+    from sklearnex.linear_model import LogisticRegression
+
+    X = np.array([[-1, 0], [0, 1], [1, 1]])
+    y = np.array([0, 1, 1])
+    C = 3.0
+    model_sklearn = _sklearn_LogisticRegression(C=C).fit(X, y)
+    model_sklearnex = LogisticRegression(C=C).fit(X, y)
+
+    try:
+        np.testing.assert_allclose(model_sklearnex.coef_, model_sklearn.coef_)
+        np.testing.assert_allclose(model_sklearnex.intercept_, model_sklearn.intercept_)
+    except AssertionError:
+
+        def logistic_model_function(predicted_probabilities, coefs):
+            neg_log_likelihood = X.shape[0] * log_loss(y, predicted_probabilities)
+            sum_squares_coefs = np.dot(coefs.reshape(-1), coefs.reshape(-1))
+            return C * neg_log_likelihood + 0.5 * sum_squares_coefs
+
+        fn_sklearn = logistic_model_function(
+            model_sklearn.predict_proba(X)[:, 1], model_sklearn.coef_
+        )
+        fn_sklearnex = logistic_model_function(
+            model_sklearnex.predict_proba(X)[:, 1], model_sklearnex.coef_
+        )
+        assert fn_sklearnex <= fn_sklearn
+
+
+def test_multinomial_logistic_regression_is_correct():
+    from sklearnex.linear_model import LogisticRegression
+
+    X = np.array([[-1, 0], [0, 1], [1, 1]])
+    y = np.array([2, 1, 0])
+    params = {"C": 3.0}
+    # for sklearn 1.8 and onwards, non-binary class datasets will multinomial
+    if not sklearn_check_version("1.8"):
+        params["multi_class"] = "multinomial"
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=FutureWarning)
+        model_sklearn = _sklearn_LogisticRegression(**params).fit(X, y)
+        model_sklearnex = LogisticRegression(**params).fit(X, y)
+
+    try:
+        np.testing.assert_allclose(model_sklearnex.coef_, model_sklearn.coef_)
+        np.testing.assert_allclose(model_sklearnex.intercept_, model_sklearn.intercept_)
+    except AssertionError:
+
+        def logistic_model_function(predicted_probabilities, coefs):
+            neg_log_likelihood = X.shape[0] * log_loss(y, predicted_probabilities)
+            sum_squares_coefs = np.dot(coefs.reshape(-1), coefs.reshape(-1))
+            return params["C"] * neg_log_likelihood + 0.5 * sum_squares_coefs
+
+        fn_sklearn = logistic_model_function(
+            model_sklearn.predict_proba(X), model_sklearn.coef_
+        )
+        fn_sklearnex = logistic_model_function(
+            model_sklearnex.predict_proba(X), model_sklearnex.coef_
+        )
+        assert fn_sklearnex <= fn_sklearn
+
+
+# Here, scikit-learn does a theoretically incorrect calculation in which
+# they set the predictions for the 'negative' class as the negative of the
+# predictions for the positive class instead of all-zeros. The idea is to
+# match theirs, which is done by falling back. This test ensures that the
+# predictions match with sklearn in case it isn't done during conformance tests.
+@pytest.mark.parametrize("fit_intercept", [False, True])
+@pytest.mark.parametrize("C", [1, 0.1])
+@pytest.mark.allow_sklearn_fallback
+def test_binary_multinomial_probabilities(fit_intercept, C):
+    from sklearnex.linear_model import LogisticRegression
+
+    # Adapted from this test:
+    # https://github.com/scikit-learn/scikit-learn/blob/baf828ca126bcb2c0ad813226963621cafe38adb/sklearn/utils/estimator_checks.py#L963
+    X = np.array(
+        [
+            [1, 3],
+            [1, 3],
+            [1, 3],
+            [1, 3],
+            [2, 1],
+            [2, 1],
+            [2, 1],
+            [2, 1],
+            [3, 3],
+            [3, 3],
+            [3, 3],
+            [3, 3],
+            [4, 1],
+            [4, 1],
+            [4, 1],
+            [4, 1],
+        ],
+        dtype=np.float64,
+    )
+    y_binary = np.array([1, 1, 1, 1, 2, 2, 2, 2, 1, 1, 1, 1, 2, 2, 2, 2], dtype=int)
+
+    params = {"C": C, "fit_intercept": fit_intercept}
+    if not sklearn_check_version("1.8"):
+        params["multi_class"] = "multinomial"
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model_sklearnex = LogisticRegression(**params).fit(X, y_binary)
+        model_sklearn = _sklearn_LogisticRegression(**params).fit(X, y_binary)
+    np.testing.assert_allclose(
+        model_sklearnex.predict_proba(X),
+        model_sklearn.predict_proba(X),
+        rtol=1e-2,
+        atol=1e-3,
+    )
+
+
+# Note: some solvers have an internal state, such as previous gradients,
+# which is not preserved across warm starts and which influences the
+# optimization routines. For these, a warm-started call with the coefficients
+# from a previous iterations will not be equal to a cold-start call with
+# one more iteration.
+# Note2: usually, passing weights will cause the procedure to fall back to
+# stock scikit-learn. We want to check that fallbacks also handle warm starts
+# correctly when falling back.
+@pytest.mark.parametrize("fit_intercept", [False, True])
+@pytest.mark.parametrize("n_classes", [2, 3])
+@pytest.mark.parametrize(
+    "multi_class", ["auto", "multinomial"] if not sklearn_check_version("1.8") else [None]
+)
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.allow_sklearn_fallback
+def test_warm_start_stateful(fit_intercept, n_classes, multi_class, weighted):
+    from sklearnex.linear_model import LogisticRegression
+
+    X, y = make_classification(
+        random_state=123,
+        n_classes=n_classes,
+        n_clusters_per_class=1,
+        n_features=2,
+        n_redundant=0,
+        # Note: oneDAL and scikit-learn deal with large numbers differently
+        # in the calculations, so when comparing against sklearn, we want
+        # to avoid ending up with large numbers in the computations.
+        class_sep=0.25,
+    )
+
+    # Note1: these will throw warnings due to reaching the maximum
+    # number of iterations without converging, which is expected
+    # given that those are being severely limited for the tests.
+    # Note2: this will first compare the results after one iteration, and
+    # if those already differ too much (which can be the case given numerical
+    # differences), will then skip the rest of test that checks the warm starts.
+    params = {
+        "solver": "lbfgs",
+        "fit_intercept": fit_intercept,
+        "max_iter": 1,
+        "warm_start": True,
+    }
+    if not sklearn_check_version("1.8"):
+        params["multi_class"] = multi_class
+
+    model1 = _sklearn_LogisticRegression(**params)
+    model2 = LogisticRegression(**params)
+
+    for est in (model1, model2):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            est.fit(
+                X,
+                y,
+                np.ones(X.shape[0]) if weighted else None,
+            )
+
+    try:
+        np.testing.assert_allclose(model1.coef_, model2.coef_)
+    except AssertionError:
+        pytest.skip("Too large numerical differences for further comparisons")
+
+    for est in (model1, model2):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            est.fit(
+                X,
+                y,
+                np.ones(X.shape[0]) if weighted else None,
+            )
+
+    np.testing.assert_allclose(model1.coef_, model2.coef_)
+    if fit_intercept:
+        if n_classes == 2:
+            np.testing.assert_allclose(model1.intercept_, model2.intercept_)
+        else:
+            # Note: softmax function is invariable to shifting by a constant
+            intercepts1 = model1.intercept_ - model1.intercept_.mean()
+            intercepts2 = model2.intercept_ - model2.intercept_.mean()
+            np.testing.assert_allclose(intercepts1, intercepts2)
+
+
+# Note: other solvers do not have any internal state and are supposed to yield the
+# same result after one iteration given the current coefficients.
+@pytest.mark.parametrize("fit_intercept", [False, True])
+@pytest.mark.parametrize(
+    "multi_class", ["ovr", "multinomial"] if not sklearn_check_version("1.8") else [None]
+)
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.allow_sklearn_fallback
+@pytest.mark.skipif(
+    not check_preview_is_enabled(), reason="Functionality in preview mode"
+)
+def test_warm_start_binary(fit_intercept, multi_class, weighted):
+    from sklearnex.linear_model import LogisticRegression
+
+    X, y = make_classification(
+        random_state=123,
+        n_classes=2,
+        n_clusters_per_class=1,
+        n_features=2,
+        n_redundant=0,
+        class_sep=0.5,
+    )
+
+    params = {"random_state": 123, "solver": "newton-cg", "fit_intercept": fit_intercept}
+    if not sklearn_check_version("1.8"):
+        params["multi_class"] = multi_class
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model1 = LogisticRegression(**params, max_iter=2)
+        model2 = LogisticRegression(**params, max_iter=1, warm_start=True)
+
+        # fit model2 twice using the same data to get 2 iterations (with warm_start)
+        for est in (model1, model2, model2):
+            est.fit(
+                X,
+                y,
+                np.ones(X.shape[0]) if weighted else None,
+            )
+
+    np.testing.assert_allclose(model1.coef_, model2.coef_)
+    if fit_intercept:
+        np.testing.assert_allclose(model1.intercept_, model2.intercept_)
+
+
+@pytest.mark.parametrize("fit_intercept", [False, True])
+@pytest.mark.parametrize(
+    "multi_class", ["ovr", "multinomial"] if not sklearn_check_version("1.8") else [None]
+)
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.allow_sklearn_fallback
+@pytest.mark.skipif(not check_preview_is_enabled(), reason="Functionality in preview")
+def test_warm_start_multinomial(fit_intercept, multi_class, weighted):
+    from sklearnex.linear_model import LogisticRegression
+
+    X, y = make_classification(
+        random_state=123,
+        n_classes=3,
+        n_clusters_per_class=1,
+        n_features=2,
+        n_redundant=0,
+        class_sep=0.5,
+    )
+
+    params = {"random_state": 123, "solver": "newton-cg", "fit_intercept": fit_intercept}
+    if not sklearn_check_version("1.8"):
+        params["multi_class"] = multi_class
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model1 = LogisticRegression(**params, max_iter=2)
+        model2 = LogisticRegression(**params, max_iter=1, warm_start=True)
+
+        # fit model2 twice using the same data to get 2 iterations (with warm_start)
+        for est in (model1, model2, model2):
+            est.fit(
+                X,
+                y,
+                np.ones(X.shape[0]) if weighted else None,
+            )
+
+    np.testing.assert_allclose(model1.coef_, model2.coef_)
+    if fit_intercept:
+        # Note: softmax function is invariable to shifting by a constant
+        intercepts1 = model1.intercept_ - model1.intercept_.mean()
+        intercepts2 = model2.intercept_ - model2.intercept_.mean()
+        np.testing.assert_allclose(intercepts1, intercepts2)
+
+
+# This is a bit different from the others - it just aims to test that it
+# is processing the regularization correctly under all circumstances, and
+# that it is not multiplying or dividing the coefficients by two when it
+# shouldn't do it.
+# It has some overlap with the tests at the beginning, but it is only tested
+# with oneDAL>=2025.8. After that version has been released and CIs updated
+# to use it, the earlier tests 'test_logistic_regression_is_correct' and
+# 'test_multinomial_logistic_regression_is_correct' can be removed.
+@pytest.mark.skipif(
+    not daal_check_version((2025, "P", 800)), reason="Bugs fixed in later oneDAL releases"
+)
+@pytest.mark.parametrize(
+    "multi_class", ["auto", "multinomial"] if not sklearn_check_version("1.8") else [None]
+)
+@pytest.mark.parametrize("C", [1, 0.2, 20.0])
+@pytest.mark.parametrize("solver", ["lbfgs", "newton-cg"])
+@pytest.mark.parametrize("n_classes", [2, 3])
+@pytest.mark.allow_sklearn_fallback
+def test_custom_solvers_are_correct(multi_class, C, solver, n_classes):
+    if solver == "newton-cg" and not check_preview_is_enabled():
+        pytest.skip("Functionality in preview mode")
+    from sklearnex.linear_model import LogisticRegression
+
+    X, y = make_classification(
+        random_state=123,
+        n_classes=n_classes,
+        n_clusters_per_class=1,
+        n_features=2,
+        n_redundant=0,
+        n_samples=50,
+        class_sep=0.25,
+    )
+
+    params = {"C": C}
+    if multi_class is not None:
+        params["multi_class"] = multi_class
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model_sklearn = _sklearn_LogisticRegression(**params).fit(X, y)
+        params["solver"] = solver
+        model_sklearnex = LogisticRegression(**params, max_iter=1_000, tol=1e-8).fit(X, y)
+        model_sklearnex_refitted = (
+            LogisticRegression(**params, max_iter=1_000, tol=1e-8, warm_start=True)
+            .fit(X, y)
+            .fit(X, y)
+        )
+
+    np.testing.assert_allclose(
+        model_sklearnex.coef_, model_sklearn.coef_, rtol=1e-3, atol=5e-3
+    )
+    if n_classes == 2:
+        np.testing.assert_allclose(
+            model_sklearnex.intercept_, model_sklearn.intercept_, atol=1e-3
+        )
+    else:
+        np.testing.assert_allclose(
+            model_sklearnex.intercept_ - model_sklearnex.intercept_.mean(),
+            model_sklearn.intercept_ - model_sklearn.intercept_.mean(),
+            atol=1e-3,
+        )
+    np.testing.assert_allclose(
+        model_sklearnex_refitted.coef_, model_sklearn.coef_, rtol=1e-3, atol=5e-3
+    )
+    if n_classes == 2:
+        np.testing.assert_allclose(
+            model_sklearnex_refitted.intercept_, model_sklearn.intercept_, atol=1e-3
+        )
+    else:
+        np.testing.assert_allclose(
+            model_sklearnex_refitted.intercept_
+            - model_sklearnex_refitted.intercept_.mean(),
+            model_sklearn.intercept_ - model_sklearn.intercept_.mean(),
+            atol=1e-3,
+        )
+
+    np.testing.assert_allclose(
+        model_sklearnex.predict_proba(X),
+        model_sklearn.predict_proba(X),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+    np.testing.assert_allclose(
+        model_sklearnex_refitted.predict_proba(X),
+        model_sklearn.predict_proba(X),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+@pytest.mark.parametrize(
+    "dataframe,queue", get_dataframes_and_queues(device_filter_="gpu")
+)
+def test_gpu_logreg_prediction_shapes(dataframe, queue):
+    if not queue or not queue.sycl_device.is_gpu:
+        pytest.skip("Test for GPU-only code branch")
+    from sklearnex.linear_model import LogisticRegression
+
+    X, y = make_classification(random_state=123)
+    X = _convert_to_dataframe(X, sycl_queue=queue, target_df=dataframe)
+    y = _convert_to_dataframe(y, sycl_queue=queue, target_df=dataframe)
+
+    model = LogisticRegression(solver="newton-cg").fit(X, y)
+    pred = model.predict(X)
+    pred_proba = model.predict_proba(X)
+    pred_log_proba = model.predict_log_proba(X)
+    pred_decision_function = model.decision_function(X)
+
+    np.testing.assert_array_equal(pred.shape, (X.shape[0],))
+    np.testing.assert_array_equal(pred_proba.shape, (X.shape[0], 2))
+    np.testing.assert_array_equal(pred_log_proba.shape, (X.shape[0], 2))
+    np.testing.assert_array_equal(pred_decision_function.shape, (X.shape[0],))
+
+
+@pytest.mark.skipif(
+    not daal_check_version((2025, "P", 900)), reason="Bugs fixed in later oneDAL releases"
+)
+@pytest.mark.parametrize("dataframe,queue", get_dataframes_and_queues())
+def test_log_proba_doesnt_return_inf(dataframe, queue):
+    if (not queue or queue.sycl_device.is_cpu) and not check_preview_is_enabled():
+        pytest.skip("Functionality in preview mode")
+    from sklearnex.linear_model import LogisticRegression
+
+    X, y = make_classification(random_state=123)
+    X = _convert_to_dataframe(X, sycl_queue=queue, target_df=dataframe)
+    y = _convert_to_dataframe(y, sycl_queue=queue, target_df=dataframe)
+
+    model = LogisticRegression(solver="newton-cg").fit(X, y)
+    X_problem = 1e10 * _as_numpy(model.coef_).reshape((1, -1))
+    X_problem = np.vstack([X_problem, -X_problem])
+
+    pred_log_proba = model.predict_log_proba(X_problem)
+    pred_log_proba = _as_numpy(pred_log_proba)
+
+    assert not np.any(np.isinf(pred_log_proba))
+
+
+@pytest.mark.parametrize("dataframe,queue", get_dataframes_and_queues())
+@pytest.mark.parametrize("y_type", ["numeric", "string"])
+@pytest.mark.allow_sklearn_fallback
+def test_array_api_logreg(dataframe, queue, y_type):
+    """Test LogisticRegression with Array API dispatch enabled.
+
+    Tests cover:
+    - GPU: dpnp arrays with newton-cg solver
+    - CPU: dpnp and array_api_strict arrays with lbfgs solver
+    - Both numeric and string label targets
+
+    Validates that:
+    1. No fallback to sklearn on GPU
+    2. Model attributes (coef_, intercept_, n_iter_) have correct types
+    3. All prediction methods return correct types and shapes
+    4. score returns a scalar value
+    """
+    from sklearnex.linear_model import LogisticRegression
+
+    is_gpu = queue is not None and queue.sycl_device.is_gpu
+
+    # Skip conditions based on device and array type
+    if is_gpu:
+        solver = "newton-cg"
+    else:
+        if not sklearn_check_version("1.9"):
+            pytest.skip("Array API with lbfgs on CPU requires sklearn>=1.9")
+        solver = "lbfgs"
+
+    # Generate test data
+    X, y = make_classification(n_samples=100, n_features=20, n_classes=2, random_state=42)
+
+    X_arr = _convert_to_dataframe(X, sycl_queue=queue, target_df=dataframe)
+    if y_type == "numeric":
+        y_arr = _convert_to_dataframe(y, sycl_queue=queue, target_df=dataframe)
+    else:
+        y_arr = np.take(["class_a", "class_b"], y)
+
+    # Fit model with array API dispatch enabled
+    with config_context(array_api_dispatch=True):
+        model = LogisticRegression(solver=solver).fit(X_arr, y_arr)
+
+    # 1. Check no fallback to sklearn on GPU
+    if is_gpu:
+        assert hasattr(
+            model, "_onedal_estimator"
+        ), "Model should not fall back to sklearn on GPU with array API"
+
+    # # 2. Check attributes have correct types (same as X)
+    def _check_predict_type_and_shape(
+        pred, expected_type, expected_shape, device_check=False
+    ):
+        assert (
+            type(pred).__name__ == expected_type.__name__
+        ), f"predict type {type(pred)} should match expected type {expected_type}"
+        assert (
+            pred.shape == expected_shape
+        ), f"predict shape {pred.shape} should be {expected_shape}"
+        if device_check:
+            assert getattr(pred, "device", None) == getattr(
+                X_arr, "device", None
+            ), "predict should be on same device as X_arr"
+
+    device_check = dataframe != "pandas"
+
+    coef_expected_type = type(X_arr) if dataframe != "pandas" else np.ndarray
+    _check_predict_type_and_shape(
+        model.coef_, coef_expected_type, (1, X.shape[1]), device_check
+    )
+    _check_predict_type_and_shape(
+        model.intercept_, coef_expected_type, (1,), device_check
+    )
+
+    # 3. Check predict returns correct type and shape
+    with config_context(array_api_dispatch=True):
+        pred = model.predict(X_arr)
+
+    if y_type == "numeric" and dataframe != "pandas":
+        pred_expected_type = type(y_arr)
+    else:
+        pred_expected_type = np.ndarray
+
+    _check_predict_type_and_shape(
+        pred, pred_expected_type, (X.shape[0],), device_check and (y_type == "numeric")
+    )
+
+    # 4. Check predict_proba returns correct type (same as X) and shape
+    with config_context(array_api_dispatch=True):
+        pred_proba = model.predict_proba(X_arr)
+    proba_expected_type = type(X_arr) if dataframe != "pandas" else np.ndarray
+    _check_predict_type_and_shape(
+        pred_proba, proba_expected_type, (X.shape[0], 2), device_check
+    )
+
+    # 5. Check predict_log_proba returns correct type (same as X) and shape
+    with config_context(array_api_dispatch=True):
+        pred_log_proba = model.predict_log_proba(X_arr)
+    _check_predict_type_and_shape(
+        pred_log_proba, proba_expected_type, (X.shape[0], 2), device_check
+    )
+
+    # 6. Check decision_function returns correct type (same as X) and shape
+    if dataframe != "pandas":
+        # If pandas dataframe provided as input stock sklearn throws an error because of incorrect logic
+        # of device comparison. When this issue is fixed, this condition should be removed
+        with config_context(array_api_dispatch=True):
+            dec_func = model.decision_function(X_arr)
+        _check_predict_type_and_shape(
+            dec_func, proba_expected_type, (X.shape[0],), device_check
+        )
+
+    # 7. Check score returns a scalar
+    with config_context(array_api_dispatch=True):
+        score = model.score(X_arr, y_arr)
+    assert isinstance(
+        score, (float, np.floating, np.number)
+    ), f"score should return a scalar, got type {type(score)}"
+
+
+@pytest.mark.skipif(
+    not sklearn_check_version("1.9"), reason="Functionality introduced in later versions"
+)
+@pytest.mark.skipif(
+    not is_sycl_device_available("gpu"), reason="Test for GPU-specific functionality."
+)
+@pytest.mark.parametrize(
+    "X_xp, X_device",
+    ([(dpnp, "gpu")] if dpnp_available else [])
+    + ([(torch, "xpu")] if torch_available else []),
+)
+def test_error_on_incompatible_devices_gpufirst(with_array_api, X_xp, X_device):
+    from sklearnex.linear_model import LogisticRegression
+
+    rng = np.random.default_rng(seed=123)
+    X = rng.random(size=(10, 3), dtype=np.float32)
+    y = rng.integers(2, size=X.shape[0])
+
+    Xa = X_xp.asarray(X, device=X_device)
+
+    model_gpu = LogisticRegression(solver="newton-cg").fit(Xa, y)
+    with pytest.raises(ValueError, match="device"):
+        model_gpu.predict(X)
+
+
+@pytest.mark.skipif(
+    not sklearn_check_version("1.9"), reason="Functionality introduced in later versions"
+)
+@pytest.mark.skipif(
+    not is_sycl_device_available("gpu"), reason="Test for GPU-specific functionality."
+)
+@pytest.mark.parametrize(
+    "X_xp, X_device",
+    ([(dpnp, "gpu")] if dpnp_available else [])
+    + ([(torch, "xpu")] if torch_available else []),
+)
+@pytest.mark.allow_sklearn_fallback
+def test_error_on_incompatible_devices_cpufirst(with_array_api, X_xp, X_device):
+    from sklearnex.linear_model import LogisticRegression
+
+    rng = np.random.default_rng(seed=123)
+    X = rng.random(size=(10, 3), dtype=np.float32)
+    y = rng.integers(2, size=X.shape[0])
+
+    Xa = X_xp.asarray(X, device=X_device)
+
+    model_cpu = LogisticRegression(solver="lbfgs").fit(X, y)
+    with pytest.raises(ValueError, match="device"):
+        model_cpu.predict(Xa)
+
+
+@pytest.mark.parametrize(
+    "dataframe,queue", get_dataframes_and_queues(device_filter_="gpu")
+)
+@pytest.mark.parametrize("fit_intercept", [True, False])
+@pytest.mark.parametrize("array_api", [False, True])
+@pytest.mark.allow_sklearn_fallback
+def test_onedal_model_from_sklearn_coefs(dataframe, queue, fit_intercept, array_api):
+    if not queue or not queue.sycl_device.is_gpu:
+        pytest.skip("Test for GPU-only code branch")
+    if array_api and not sklearn_check_version("1.9"):
+        pytest.skip("Functionality introduced in later sklearn versions.")
+    from sklearn.linear_model import LogisticRegression as _sklearn_LogisticRegression
+
+    from sklearnex.linear_model import LogisticRegression
+
+    X, y = make_classification(
+        n_samples=100, n_features=20, n_classes=2, random_state=123
+    )
+    X = _convert_to_dataframe(X, sycl_queue=queue, target_df=dataframe)
+    y = _convert_to_dataframe(y, sycl_queue=queue, target_df=dataframe)
+
+    # This should fall back to sklearn for model fitting
+    with config_context(array_api_dispatch=array_api):
+        model = LogisticRegression(solver="lbfgs", fit_intercept=fit_intercept).fit(X, y)
+    assert not hasattr(model, "_onedal_estimator")
+
+    # Then this should trigger creation of a oneDAL object on the fly,
+    # which should get used to make predictions
+    with config_context(array_api_dispatch=array_api):
+        proba = model.predict_proba(X)
+        pred = model.predict(X)
+    proba = _as_numpy(proba)
+    pred = _as_numpy(pred)
+
+    assert hasattr(model, "_onedal_estimator")
+
+    X_np = _as_numpy(X)
+    y_np = _as_numpy(y)
+    model_sklearn = _sklearn_LogisticRegression(
+        solver="lbfgs", fit_intercept=fit_intercept
+    ).fit(X_np, y_np)
+    proba_sklearn = model_sklearn.predict_proba(X_np)
+    pred_sklearn = model_sklearn.predict(X_np)
+    np.testing.assert_allclose(proba, proba_sklearn)
+    np.testing.assert_array_equal(pred, pred_sklearn)
+
+
+# TODO: remove this once scikit-learn1.8 and 1.9 are no longer supported.
+@pytest.mark.skipif(
+    not sklearn_check_version("1.8"),
+    reason="Workaround for warning issued in specific scikit-learn versions",
+)
+@pytest.mark.allow_sklearn_fallback
+def test_no_warning_for_n_jobs():
+    from sklearnex.linear_model import LogisticRegression
+
+    model = LogisticRegression(n_jobs=2, solver="newton-cholesky")
+
+    rng = np.random.default_rng(seed=123)
+    X = rng.random(size=(10, 3))
+    y = rng.integers(2, size=X.shape[0])
+    w = rng.standard_gamma(1, size=X.shape[0])
+
+    # Note: this is meant to trigger a fallback by passing weights and a
+    # solver which is not supported by oneDAL. If oneDAL starts supporting
+    # this setting, it should find some other way of triggering a fallback.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", category=FutureWarning)
+        model.fit(X, y, w)
+
+
+@pytest.mark.skipif(
+    not sklearn_check_version("1.9"),
+    reason="Functionality introduced in later sklearn versions",
+)
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_dtype_is_preserved(dtype):
+    from sklearnex.linear_model import LogisticRegression
+
+    rng = np.random.default_rng(seed=123)
+    X = rng.random(size=(10, 3)).astype(dtype)
+    y = rng.integers(2, size=X.shape[0]).astype(np.int64)
+    model = LogisticRegression().fit(X, y)
+    assert model.coef_.dtype == X.dtype
+    assert model.intercept_.dtype == X.dtype

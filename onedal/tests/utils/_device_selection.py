@@ -15,70 +15,103 @@
 # ==============================================================================
 
 import functools
+import warnings
+from collections.abc import Iterable
 
 import pytest
 
+from onedal import _dpc_backend
+from onedal.utils._third_party import SyclQueue, dpctl_available
 
-def get_queues(filter_="cpu,gpu"):
-    queues = []
+if dpctl_available:
+    import dpctl
 
-    try:
-        import dpctl
+    queue_creation_err = dpctl._sycl_queue.SyclQueueCreationError
+else:
+    queue_creation_err = (RuntimeError, ValueError)
 
-        if dpctl.has_cpu_devices() and "cpu" in filter_:
-            queues.append(pytest.param(dpctl.SyclQueue("cpu"), id="SyclQueue_CPU"))
-        if dpctl.has_gpu_devices() and "gpu" in filter_:
-            queues.append(pytest.param(dpctl.SyclQueue("gpu"), id="SyclQueue_GPU"))
-    finally:
+
+# lru_cache is used to limit the number of SyclQueues generated
+# @functools.lru_cache()
+def get_queues(filter_: str = "cpu,gpu") -> list[SyclQueue]:
+    """Get available dpctl.SycQueues for testing.
+
+    This is meant to be used for testing purposes only.
+
+    Parameters
+    ----------
+    filter_ : str, default="cpu,gpu"
+        Configure output list with available SyclQueues for testing.
+        SyclQueues are generated from a comma-separated string with
+        each element conforming to SYCL's ``filter_selector``.
+
+    Returns
+    -------
+    list[SyclQueue]
+        The list of SyclQueues.
+
+    Notes
+    -----
+        Do not use filters for the test cases disabling. Use `pytest.skip`
+        or `pytest.xfail` instead.
+    """
+    queues = [None] if "cpu" in filter_ else []
+    if _dpc_backend is None:
+        if "gpu" in filter_:
+            warnings.warn(
+                "Attempting to get a GPU queue, but DPC backend is not available."
+            )
         return queues
 
+    for i in filter_.split(","):
+        try:
+            queues.append(pytest.param(SyclQueue(i), id=f"SyclQueue_{i.upper()}"))
+        except queue_creation_err:
+            pass
 
-def get_memory_usm():
-    try:
-        from dpctl.memory import MemoryUSMDevice, MemoryUSMShared
-
-        return [MemoryUSMDevice, MemoryUSMShared]
-    except ImportError:
-        return []
-
-
-def is_dpctl_available(targets=None):
-    try:
-        import dpctl
-
-        if targets is None:
-            return True
-        for device in targets:
-            if device == "cpu" and not dpctl.has_cpu_devices():
-                return False
-            if device == "gpu" and not dpctl.has_gpu_devices():
-                return False
-        return True
-    except ImportError:
-        return False
+    return queues
 
 
-def device_type_to_str(queue):
-    if queue is None:
-        return "cpu"
+def is_sycl_device_available(targets: Iterable[str]) -> bool:
+    """Check if a SYCL device is available.
 
-    from dpctl import device_type
+    This is meant to be used for testing purposes only.
+    The check succeeds if all SYCL devices in targets are
+    available.
 
-    if queue.sycl_device.device_type == device_type.cpu:
-        return "cpu"
-    if queue.sycl_device.device_type == device_type.gpu:
-        return "gpu"
-    return "unknown"
+    Parameters
+    ----------
+    targets : Iterable[str]
+        SYCL filter strings of possible devices.
+
+    Returns
+    -------
+    bool
+        Flag if all of the SYCL targets are available.
+
+    """
+    if not isinstance(targets, Iterable):
+        raise TypeError("`targets` should be an iterable of strings.")
+    if isinstance(targets, str):
+        targets = [targets]
+    for device in targets:
+        try:
+            SyclQueue(device)
+        except queue_creation_err:
+            return False
+    return True
 
 
 def pass_if_not_implemented_for_gpu(reason=""):
+    """Decorator for test functions. Asserts the test fails with the specified `reason` when running on GPU.
+    Used to ensure that a meaningful error message is provided by the backend."""
     assert reason
 
     def decorator(test):
         @functools.wraps(test)
         def wrapper(queue, *args, **kwargs):
             if queue is not None and queue.sycl_device.is_gpu:
-                with pytest.raises(RuntimeError, match="is not implemented for GPU"):
+                with pytest.raises(RuntimeError, match=reason):
                     test(queue, *args, **kwargs)
             else:
                 test(queue, *args, **kwargs)

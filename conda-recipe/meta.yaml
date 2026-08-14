@@ -14,97 +14,173 @@
 # limitations under the License.
 #===============================================================================
 
-{% set version = '2024.1' %}
+# NB: this recipe should be synced between sklearnex repo and feedstocks
+
+{% set name = "scikit-learn-intelex" %}
 {% set buildnumber = 0 %}
+# version is set manually in feedstocks and through git tag in repo
+# {% set version = "1.1.1" %}
 
 package:
-    name: daal4py
-    version: {{ version }}
+  # Top-level package name is a placeholder - name not used directly.
+  name: {{ name|lower }}-feedstock
+  version: {{ environ.get('GIT_DESCRIBE_TAG') }}
+  # version: {{ version }}
 
+# Reminder: source should point to path for repo or github archive for feedstock
+# source:
+#   url: https://github.com/uxlfoundation/scikit-learn-intelex/archive/{{ version }}.tar.gz
+#   sha256: ...
 source:
-    path: ..
+  path: ..
 
 build:
-    number: {{ buildnumber }}
-    include_recipe: False
-    script_env:
+  skip: true  # [not (linux64 or win)]
+  number: {{ buildnumber }}
+  include_recipe: False
+  script_env:
     - DPCPPROOT
     - DALROOT
-    ignore_run_exports:
-       - python
-       - mpich
+    - NO_DIST=1  # [win]
 
+# Top-level requirements apply to the shared build.sh/bld.bat that compiles
+# and stages host + dpc artifacts once. Each output's pack.sh then copies
+# the subset of files that belong to that output.
 requirements:
+  build:
+    - make  # [linux]
+    - {{ compiler('dpcpp') }}
+    - {{ compiler('cxx') }}
+    # conda-forge feedstock specific
+    # - {{ stdlib("c") }}  # [linux64 or win]
+  host:
+    - python
+    - setuptools
+    - cmake
+    - clang-format
+    - cython
+    - jinja2
+    - pybind11
+    - numpy >=2,<3
+    # dal-devel pinning depends on the recipe location (repo or feedstock)
+    - dal-devel
+    # - dal-devel =={{ version }}
+    - impi-devel  # [not win]
+    - mpi * impi  # [not win]
+
+outputs:
+  - name: scikit-learn-intelex
     build:
-        - {{ compiler('cxx') }}  # [not osx]
-        - {{ compiler('c') }}  # [not osx]
-    host:
+      # Suppress dpcpp run_exports so CPU package doesn't pull intel-sycl-rt.
+      ignore_run_exports_from:
+        - {{ compiler('dpcpp') }}
+    script: pack.sh  # [linux]
+    script: pack.bat  # [win]
+    requirements:
+      build:
+        - make  # [linux]
+        - {{ compiler('dpcpp') }}
+        - {{ compiler('cxx') }}
+      host:
         - python
         - setuptools
-        - numpy {{ numpy }}
-        - dal-devel ==2024.1.0
-        - cython
-        - jinja2
-        - mpich  # [osx]
-        - impi-devel  # [not osx]
-        - clang-tools
-        - pybind11
-        - make
-    run:
+        - numpy >=2,<3
+        - dal-devel
+        - impi-devel  # [not win]
+        - mpi * impi  # [not win]
+      run:
         - python
-        - dpcpp_cpp_rt ==2024.1.0  # [linux]
-        - dpcpp_cpp_rt ==2024.1.0  # [win or osx]
-        - dal ==2024.1.0
-    ignore_run_exports:
         - numpy
-
-test:
-    requires:
-        - lightgbm  # [not win]
-        - pandas
-        - scipy
         - scikit-learn
-        - threadpoolctl
-        - xgboost  # [not win]
-        - catboost
+        # dal-devel has run_exports on conda-forge, so no need to add it.
+        - mpi * impi  # [not win]
+        - packaging
+    test:
+      requires:
+        # for QA we control the test version ceiling, which follows repository
+        # guidelines where sklearn support may exist but is not verified
+        # outside certain versions. Renovate is used to lockstep with
+        # requirements-test.txt
+        # renovate: datasource=conda depName=conda-forge/scikit-learn
+        - "scikit-learn <=1.9.0"
+        - pyyaml
+        - mpi * impi  # [not win]
+        - mpi4py  # [not win]
+        # next deps are synced with requirements-test.txt
         - pytest
-        - mpich  # [osx]
-        - impi_rt  # [not osx]
-    source_files:
+        - pytest-mock
+        - pytest-mpi  # [not win]
+        - pandas
+        - xgboost
+        - lightgbm
+        - shap
+        - catboost
+        - treelite
+        - array-api-compat
+        - array-api-strict
+        - polars
+      source_files:
+        - .ci
+        - setup.cfg
         - examples
         - tests
-        - daal4py/sklearn
-    commands:
-        - python -c "import daal4py"
-        - mpirun -n 4 python -m unittest discover -v -s tests -p test*spmd*.py # [not win]
-        - mpiexec -localonly -n 4 python -m unittest discover -v -s tests -p test*spmd*.py # [win]
-        - python -m unittest discover -v -s tests -p test*.py
-        - pytest --pyargs daal4py/sklearn/
-        - python tests/run_examples.py
-        - python -m daal4py tests/daal4py/sycl/sklearn_sycl.py
+      script: run_test.sh  # [linux]
+      script: run_test.bat  # [win]
+    about:
+      summary: Extension for scikit-learn* (CPU runtime) is a seamless way to speed up your scikit-learn application.
+
+  - name: scikit-learn-intelex-gpu
+    script: pack.sh  # [linux]
+    script: pack.bat  # [win]
+    requirements:
+      build:
+        - make  # [linux]
+        - {{ compiler('dpcpp') }}
+      host:
+        - python
+        - setuptools
+        - numpy >=2,<3
+        - dal-devel
+        - dal-gpu
+        - impi-devel  # [not win]
+        - mpi * impi  # [not win]
+      run:
+        - {{ pin_subpackage('scikit-learn-intelex', exact=True) }}
+        - dal-gpu
+        # intel-sycl-rt injected automatically via dpcpp compiler run_exports.
+    test:
+      requires:
+        - dpcpp-cpp-rt
+      commands:
+        # Ensure dpc module can be imported.
+        - python -c "import onedal._onedal_py_dpc"
+        - python -c "import onedal._onedal_py_spmd_dpc"  # [not win]
+    about:
+      summary: Extension for scikit-learn* (GPU/DPC++ runtime) — enables oneAPI SYCL-based acceleration.
 
 about:
-    about:
-        home: https://intelpython.github.io/daal4py/
-        license: Apache-2.0
-        license_file:
-              - LICENSE
-              - doc/third-party-programs.txt
-        summary: A convenient Python API to Intel (R) oneAPI Data Analytics Library
-        description: |
-          <strong>LEGAL NOTICE: Use of this software package is subject to the
-          software license agreement (as set forth above, in the license section of
-          the installed Conda package and/or the README file) and all notices,
-          disclaimers or license terms for third party or open source software
-          included in or with the software.</strong>
-          <br/><br/>
-          EULA: <a href="https://opensource.org/licenses/Apache-2.0" target="_blank">Apache-2.0</a>
-          <br/><br/>
-        dev_url: https://github.com/IntelPython/daal4py
-        doc_url: https://intelpython.github.io/daal4py
+  home: https://uxlfoundation.github.io/scikit-learn-intelex
+  license: Apache-2.0
+  license_file:
+    - LICENSE
+    - doc/third-party-programs-sklearnex.txt
+  summary: Extension for scikit-learn* is a seamless way to speed up your scikit-learn application.
+  description: |
+    <strong>LEGAL NOTICE: Use of this software package is subject to the
+    software license agreement (as set forth above, in the license section of
+    the installed Conda package and/or the README file) and all notices,
+    disclaimers or license terms for third party or open source software
+    included in or with the software.</strong>
+    <br/><br/>
+    EULA: <a href="https://opensource.org/licenses/Apache-2.0" target="_blank">Apache-2.0</a>
+    <br/><br/>
+  dev_url: https://github.com/uxlfoundation/scikit-learn-intelex
+  doc_url: https://uxlfoundation.github.io/scikit-learn-intelex
 
 extra:
-    recipe-maintainers:
-        # GitHub IDs for maintainers of the recipe.
-        - napetrov
-        - Alexsandruss
+  recipe-maintainers:
+    # GitHub IDs for maintainers of the recipe.
+    - napetrov
+    - david-cortes-intel
+    - maria-Petrova
+    - ethanglaser

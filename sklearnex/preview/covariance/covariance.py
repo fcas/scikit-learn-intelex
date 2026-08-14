@@ -15,57 +15,84 @@
 # ===============================================================================
 
 import warnings
+from functools import partial
 
-import numpy as np
-from scipy import sparse as sp
-from sklearn.covariance import EmpiricalCovariance as sklearn_EmpiricalCovariance
-from sklearn.utils import check_array
+from sklearn.base import clone
+from sklearn.covariance import EmpiricalCovariance as _sklearn_EmpiricalCovariance
+from sklearn.utils._array_api import get_namespace
+from sklearn.utils.validation import check_array, check_is_fitted
 
 from daal4py.sklearn._n_jobs_support import control_n_jobs
-from daal4py.sklearn._utils import daal_check_version, sklearn_check_version
-from onedal.common.hyperparameters import get_hyperparameters
+from daal4py.sklearn._utils import daal_check_version, is_sparse, sklearn_check_version
+from daal4py.sklearn.metrics import pairwise_distances
 from onedal.covariance import EmpiricalCovariance as onedal_EmpiricalCovariance
+from onedal.utils._array_api import _is_numpy_namespace
+from onedal.utils.validation import _num_features
 from sklearnex import config_context
-from sklearnex.metrics import pairwise_distances
 
-from ..._device_offload import dispatch, wrap_output_data
+from ..._device_offload import dispatch, support_input_format, wrap_output_data
 from ..._utils import PatchingConditionsChain, register_hyperparameters
+from ...base import oneDALEstimator
+from ...utils._array_api import _pinvh, enable_array_api, log_likelihood
+from ...utils.validation import assert_all_finite, validate_data
+
+if sklearn_check_version("1.9"):
+    from sklearn.utils._array_api import check_same_namespace
+
+# This is a temporary workaround for issues with sklearnex._device_offload._get_host_inputs
+# passing kwargs with sycl queues with other host data will cause failures
+# Note: this wrapper could potentially be removed later if sklearn implements
+# array API support for this metric in their pairwise_distances class.
+_mahalanobis = support_input_format(partial(pairwise_distances, metric="mahalanobis"))
 
 
-@register_hyperparameters({"fit": get_hyperparameters("covariance", "compute")})
+@enable_array_api
+@register_hyperparameters({"fit": ("covariance", "compute")})
 @control_n_jobs(decorated_methods=["fit", "mahalanobis"])
-class EmpiricalCovariance(sklearn_EmpiricalCovariance):
-    __doc__ = sklearn_EmpiricalCovariance.__doc__
+class EmpiricalCovariance(oneDALEstimator, _sklearn_EmpiricalCovariance):
+    __doc__ = _sklearn_EmpiricalCovariance.__doc__
 
-    if sklearn_check_version("1.2"):
-        _parameter_constraints: dict = {
-            **sklearn_EmpiricalCovariance._parameter_constraints,
-        }
+    _parameter_constraints: dict = {
+        **_sklearn_EmpiricalCovariance._parameter_constraints,
+    }
+
+    def _set_covariance(self, covariance):
+        covariance = check_array(covariance, ensure_all_finite=False)
+        assert_all_finite(covariance)
+        # set covariance
+        self.covariance_ = covariance
+        # set precision
+        if self.store_precision:
+            self.precision_ = _pinvh(covariance, check_finite=False)
+        else:
+            self.precision_ = None
 
     def _save_attributes(self):
         assert hasattr(self, "_onedal_estimator")
         if not daal_check_version((2024, "P", 400)) and self.assume_centered:
+            xp, _ = get_namespace(self._onedal_estimator.location_)
             location = self._onedal_estimator.location_[None, :]
-            self._onedal_estimator.covariance_ += np.dot(location.T, location)
-            self._onedal_estimator.location_ = np.zeros_like(np.squeeze(location))
+            self._onedal_estimator.covariance_ += xp.dot(location.T, location)
+            self._onedal_estimator.location_ = xp.zeros_like(
+                self._onedal_estimator.location_
+            )
         self._set_covariance(self._onedal_estimator.covariance_)
         self.location_ = self._onedal_estimator.location_
 
     _onedal_covariance = staticmethod(onedal_EmpiricalCovariance)
 
     def _onedal_fit(self, X, queue=None):
+        xp, _ = get_namespace(X)
+        X = validate_data(self, X, dtype=[xp.float64, xp.float32])
+
         if X.shape[0] == 1:
             warnings.warn(
                 "Only one sample available. You may want to reshape your data array"
             )
 
-        onedal_params = {
-            "method": "dense",
-            "bias": True,
-            "assume_centered": self.assume_centered,
-        }
-
-        self._onedal_estimator = self._onedal_covariance(**onedal_params)
+        self._onedal_estimator = self._onedal_covariance(
+            method="dense", bias=True, assume_centered=self.assume_centered
+        )
         self._onedal_estimator.fit(X, queue=queue)
         self._save_attributes()
 
@@ -78,7 +105,7 @@ class EmpiricalCovariance(sklearn_EmpiricalCovariance):
             (X,) = data
             patching_status.and_conditions(
                 [
-                    (not sp.issparse(X), "X is sparse. Sparse input is not supported."),
+                    (not is_sparse(X), "X is sparse. Sparse input is not supported."),
                 ]
             )
             return patching_status
@@ -87,47 +114,136 @@ class EmpiricalCovariance(sklearn_EmpiricalCovariance):
     _onedal_cpu_supported = _onedal_supported
     _onedal_gpu_supported = _onedal_supported
 
-    def fit(self, X, y=None):
-        if sklearn_check_version("1.2"):
-            self._validate_params()
-        if sklearn_check_version("0.23"):
-            X = self._validate_data(X, force_all_finite=False)
+    def get_precision(self):
+        # use array API-enabled version
+        if self.store_precision:
+            precision = self.precision_
         else:
-            X = check_array(X, force_all_finite=False)
+            precision = _pinvh(self.covariance_, check_finite=False)
+        return precision
 
+    def fit(self, X, y=None):
+        self._validate_params()
         dispatch(
             self,
             "fit",
             {
                 "onedal": self.__class__._onedal_fit,
-                "sklearn": sklearn_EmpiricalCovariance.fit,
+                "sklearn": _sklearn_EmpiricalCovariance.fit,
             },
             X,
         )
 
         return self
 
-    # expose sklearnex pairwise_distances if mahalanobis distance eventually supported
     @wrap_output_data
-    def mahalanobis(self, X):
-        if sklearn_check_version("1.0"):
-            X = self._validate_data(X, reset=False)
-        else:
-            X = check_array(X)
+    def score(self, X_test, y=None):
 
+        check_is_fitted(self)
+        if sklearn_check_version("1.9"):
+            check_same_namespace(X_test, self, attribute="covariance_", method="score")
+        xp, _ = get_namespace(X_test, self.covariance_)
+
+        X = validate_data(
+            self,
+            X_test,
+            dtype=[xp.float64, xp.float32],
+            reset=False,
+        )
+
+        location = self.location_
         precision = self.get_precision()
-        with config_context(assume_finite=True):
-            # compute mahalanobis distances
-            dist = pairwise_distances(
-                X, self.location_[np.newaxis, :], metric="mahalanobis", VI=precision
+
+        est = clone(self)
+        est.set_params(assume_centered=True)
+
+        # ensure test_cov shares X's namespace and device before log_likelihood
+        test_cov = est.fit(X - self.location_).covariance_
+        if not _is_numpy_namespace(xp):
+            test_cov = xp.asarray(test_cov, device=X.device)
+        res = log_likelihood(test_cov, self.get_precision())
+
+        return res
+
+    @wrap_output_data
+    def error_norm(self, comp_cov, norm="frobenius", scaling=True, squared=True):
+        # equivalent to the sklearn implementation but written for array API
+        # in the case of numpy-like inputs it will use sklearn's version instead.
+        # This can be deprecated if/when sklearn makes the equivalent array API enabled.
+        check_is_fitted(self)
+        if sklearn_check_version("1.9"):
+            check_same_namespace(
+                comp_cov, self, attribute="covariance_", method="error_norm"
+            )
+        xp, _ = get_namespace(comp_cov, self.covariance_)
+        c_cov = validate_data(
+            self,
+            comp_cov,
+            dtype=[xp.float64, xp.float32],
+            reset=False,
+        )
+
+        if _is_numpy_namespace(xp):
+            # must be done this way is it does not inherit from sklearn
+            return _sklearn_EmpiricalCovariance.error_norm(
+                self, c_cov, norm=norm, scaling=scaling, squared=squared
             )
 
-        return np.reshape(dist, (len(X),)) ** 2
+        # compute the error
+        error = c_cov - self.covariance_
+        # compute the error norm
+        if norm == "frobenius":
+            squared_norm = xp.matmul(xp.reshape(error, (-1)), xp.reshape(error, (-1)))
+        elif norm == "spectral":
+            squared_norm = xp.max(xp.linalg.svdvals(xp.matmul(error.T, error)))
+        else:
+            raise NotImplementedError("Only spectral and frobenius norms are implemented")
+        # optionally scale the error norm
+        if scaling:
+            squared_norm = squared_norm / error.shape[0]
+        # finally get either the squared norm or the norm
+        if squared:
+            result = squared_norm
+        else:
+            result = xp.sqrt(squared_norm)
 
-    error_norm = wrap_output_data(sklearn_EmpiricalCovariance.error_norm)
-    score = wrap_output_data(sklearn_EmpiricalCovariance.score)
+        return result
 
-    fit.__doc__ = sklearn_EmpiricalCovariance.fit.__doc__
-    mahalanobis.__doc__ = sklearn_EmpiricalCovariance.mahalanobis
-    error_norm.__doc__ = sklearn_EmpiricalCovariance.error_norm.__doc__
-    score.__doc__ = sklearn_EmpiricalCovariance.score.__doc__
+    # expose sklearnex pairwise_distances if mahalanobis distance eventually supported
+    def mahalanobis(self, X):
+        # This must be done as ```support_input_format``` is insufficient for array API
+        # support when attributes are non-numpy.
+        check_is_fitted(self)
+        if sklearn_check_version("1.9"):
+            check_same_namespace(X, self, attribute="covariance_", method="mahalanobis")
+        precision = self.get_precision()
+        loc = self.location_[None, :]
+        xp, _ = get_namespace(X, precision, loc)
+        # do not check dtype, done in pairwise_distances
+        X_in = validate_data(self, X, reset=False)
+
+        with config_context(assume_finite=True):
+            try:
+                dist = _mahalanobis(X_in, loc, VI=precision)
+
+            except ValueError as e:
+                # Throw the expected sklearn error in an n_feature length violation
+                if "Incompatible dimension for X and Y matrices: X.shape[1] ==" in str(e):
+                    raise ValueError(
+                        f"X has {_num_features(X)} features, but {self.__class__.__name__} "
+                        f"is expecting {self.n_features_in_} features as input."
+                    ) from None
+                else:
+                    raise e
+
+        if not _is_numpy_namespace(xp):
+            dist = xp.asarray(dist, device=X.device)
+
+        return (xp.reshape(dist, (-1,))) ** 2
+
+    fit.__doc__ = _sklearn_EmpiricalCovariance.fit.__doc__
+    mahalanobis.__doc__ = _sklearn_EmpiricalCovariance.mahalanobis.__doc__
+    error_norm.__doc__ = _sklearn_EmpiricalCovariance.error_norm.__doc__
+    score.__doc__ = _sklearn_EmpiricalCovariance.score.__doc__
+    get_precision.__doc__ = _sklearn_EmpiricalCovariance.get_precision.__doc__
+    _set_covariance.__doc__ = _sklearn_EmpiricalCovariance._set_covariance.__doc__

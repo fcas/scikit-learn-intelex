@@ -14,44 +14,27 @@
 # limitations under the License.
 # ===============================================================================
 
-import numbers
-from abc import ABC
-
-import numpy as np
-from scipy import sparse as sp
-from sklearn.cluster import DBSCAN as sklearn_DBSCAN
-from sklearn.utils.validation import _check_sample_weight
+from sklearn.cluster import DBSCAN as _sklearn_DBSCAN
+from sklearn.utils._array_api import get_namespace
 
 from daal4py.sklearn._n_jobs_support import control_n_jobs
-from daal4py.sklearn._utils import sklearn_check_version
+from daal4py.sklearn._utils import is_sparse
 from onedal.cluster import DBSCAN as onedal_DBSCAN
+from onedal.utils._array_api import _is_numpy_namespace
 
 from .._device_offload import dispatch
 from .._utils import PatchingConditionsChain
-
-if sklearn_check_version("1.1") and not sklearn_check_version("1.2"):
-    from sklearn.utils import check_scalar
-
-
-class BaseDBSCAN(ABC):
-    def _onedal_dbscan(self, **onedal_params):
-        return onedal_DBSCAN(**onedal_params)
-
-    def _save_attributes(self):
-        assert hasattr(self, "_onedal_estimator")
-
-        self.labels_ = self._onedal_estimator.labels_
-        self.core_sample_indices_ = self._onedal_estimator.core_sample_indices_
-        self.components_ = self._onedal_estimator.components_
-        self.n_features_in_ = self._onedal_estimator.n_features_in_
+from ..base import oneDALEstimator
+from ..utils._array_api import enable_array_api
+from ..utils.validation import _check_sample_weight, validate_data
 
 
+@enable_array_api
 @control_n_jobs(decorated_methods=["fit"])
-class DBSCAN(sklearn_DBSCAN, BaseDBSCAN):
-    __doc__ = sklearn_DBSCAN.__doc__
+class DBSCAN(oneDALEstimator, _sklearn_DBSCAN):
+    __doc__ = _sklearn_DBSCAN.__doc__
 
-    if sklearn_check_version("1.2"):
-        _parameter_constraints: dict = {**sklearn_DBSCAN._parameter_constraints}
+    _parameter_constraints: dict = {**_sklearn_DBSCAN._parameter_constraints}
 
     def __init__(
         self,
@@ -84,7 +67,16 @@ class DBSCAN(sklearn_DBSCAN, BaseDBSCAN):
         self.p = p
         self.n_jobs = n_jobs
 
+    _onedal_dbscan = staticmethod(onedal_DBSCAN)
+
     def _onedal_fit(self, X, y, sample_weight=None, queue=None):
+        xp, _ = get_namespace(X, y, sample_weight)
+        X = validate_data(self, X, accept_sparse="csr", dtype=[xp.float64, xp.float32])
+        if sample_weight is not None:
+            sample_weight = _check_sample_weight(
+                sample_weight, X, dtype=[xp.float64, xp.float32]
+            )
+
         onedal_params = {
             "eps": self.eps,
             "min_samples": self.min_samples,
@@ -98,7 +90,17 @@ class DBSCAN(sklearn_DBSCAN, BaseDBSCAN):
         self._onedal_estimator = self._onedal_dbscan(**onedal_params)
 
         self._onedal_estimator.fit(X, y=y, sample_weight=sample_weight, queue=queue)
-        self._save_attributes()
+        if self._onedal_estimator.core_sample_indices_ is None:
+            kwargs = {"dtype": xp.int32}  # always the same
+            if not _is_numpy_namespace(xp):
+                kwargs["device"] = X.device
+            self.core_sample_indices_ = xp.empty((0,), **kwargs)
+        else:
+            self.core_sample_indices_ = self._onedal_estimator.core_sample_indices_
+
+        self.components_ = xp.take(X, self.core_sample_indices_, axis=0)
+        self.labels_ = self._onedal_estimator.labels_
+        self.n_features_in_ = X.shape[1]
 
     def _onedal_supported(self, method_name, *data):
         class_name = self.__class__.__name__
@@ -106,7 +108,7 @@ class DBSCAN(sklearn_DBSCAN, BaseDBSCAN):
             f"sklearn.cluster.{class_name}.{method_name}"
         )
         if method_name == "fit":
-            X, y, sample_weight = data
+            X = data[0]
             patching_status.and_conditions(
                 [
                     (
@@ -120,7 +122,7 @@ class DBSCAN(sklearn_DBSCAN, BaseDBSCAN):
                         f"'{self.metric}' (p={self.p}) metric is not supported. "
                         "Only 'euclidean' or 'minkowski' with p=2 metrics are supported.",
                     ),
-                    (not sp.issparse(X), "X is sparse. Sparse input is not supported."),
+                    (not is_sparse(X), "X is sparse. Sparse input is not supported."),
                 ]
             )
             return patching_status
@@ -133,52 +135,13 @@ class DBSCAN(sklearn_DBSCAN, BaseDBSCAN):
         return self._onedal_supported(method_name, *data)
 
     def fit(self, X, y=None, sample_weight=None):
-        if sklearn_check_version("1.2"):
-            self._validate_params()
-        elif sklearn_check_version("1.1"):
-            check_scalar(
-                self.eps,
-                "eps",
-                target_type=numbers.Real,
-                min_val=0.0,
-                include_boundaries="neither",
-            )
-            check_scalar(
-                self.min_samples,
-                "min_samples",
-                target_type=numbers.Integral,
-                min_val=1,
-                include_boundaries="left",
-            )
-            check_scalar(
-                self.leaf_size,
-                "leaf_size",
-                target_type=numbers.Integral,
-                min_val=1,
-                include_boundaries="left",
-            )
-            if self.p is not None:
-                check_scalar(
-                    self.p,
-                    "p",
-                    target_type=numbers.Real,
-                    min_val=0.0,
-                    include_boundaries="left",
-                )
-            if self.n_jobs is not None:
-                check_scalar(self.n_jobs, "n_jobs", target_type=numbers.Integral)
-        else:
-            if self.eps <= 0.0:
-                raise ValueError(f"eps == {self.eps}, must be > 0.0.")
-
-        if sample_weight is not None:
-            sample_weight = _check_sample_weight(sample_weight, X)
+        self._validate_params()
         dispatch(
             self,
             "fit",
             {
                 "onedal": self.__class__._onedal_fit,
-                "sklearn": sklearn_DBSCAN.fit,
+                "sklearn": _sklearn_DBSCAN.fit,
             },
             X,
             y,
@@ -187,4 +150,4 @@ class DBSCAN(sklearn_DBSCAN, BaseDBSCAN):
 
         return self
 
-    fit.__doc__ = sklearn_DBSCAN.fit.__doc__
+    fit.__doc__ = _sklearn_DBSCAN.fit.__doc__

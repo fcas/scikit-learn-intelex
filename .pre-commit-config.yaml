@@ -16,12 +16,32 @@
 
 repos:
   - repo: https://github.com/psf/black
-    rev: 23.7.0
+    rev: 26.5.1
     hooks:
       - id: black
-        language_version: python3.10
   - repo: https://github.com/PyCQA/isort
-    rev: 5.12.0
+    rev: 8.0.1
     hooks:
       - id: isort
-        language_version: python3.10
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v20.1.8
+    hooks:
+      - id: clang-format
+  - repo: https://github.com/numpy/numpydoc
+    rev: v1.10.0
+    hooks:
+      - id: numpydoc-validation
+        exclude: |
+            (?x)(
+                .ci/|
+                daal4py/|
+                examples/|
+                generator/|
+                scripts/|
+                tests/
+            )
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.3
+    hooks:
+      - id: codespell
+        args: ["--config", ".github/.codespellrc" ]

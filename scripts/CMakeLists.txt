@@ -18,15 +18,29 @@ cmake_minimum_required(VERSION 3.13 FATAL_ERROR)
 
 project("oneDAL python interface"
     LANGUAGES CXX
-    HOMEPAGE_URL https://github.com/oneapi-src/oneDAL
+    HOMEPAGE_URL https://github.com/uxlfoundation/oneDAL
 )
 
 set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_COMPILE_WARNING_AS_ERROR ON)
+
+option(ADD_ONEDAL_RPATH "Adds oneDAL's file paths to the RPATH here" OFF)
+message(STATUS "ADD_ONEDAL_RPATH:" ${ADD_ONEDAL_RPATH})
+
+option(SKLEARNEX_GCOV "Compile with gcov" OFF)
+message(STATUS "SKLEARNEX_GCOV:" ${SKLEARNEX_GCOV})
+
+option(USING_LLD "Using LLD as linker" OFF)
+message(STATUS "USING_LLD:" ${USING_LLD})
 
 if(WIN32)
+    # hint CMake to get python from PYTHON env. variable if defined
+    if(DEFINED ENV{PYTHON})
+        set(PYTHON_EXECUTABLE $ENV{PYTHON})
+    endif()
     set(SDL_FLAGS "-GS -DynamicBase")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHsc /MD")
 elseif(UNIX)
@@ -35,8 +49,19 @@ elseif(UNIX)
         set(ONEDAL_PY_LINK_OPTIONS "-fwrapv")
         set(CMAKE_INSTALL_RPATH "@loader_path/../../../")
     else()
-        set(ONEDAL_PY_LINK_OPTIONS "-Wl,-z,noexecstack,-z,relro,-z,now,-fstack-protector-strong,-fno-strict-overflow,-fno-delete-null-pointer-checks,-fwrapv")
-        set(CMAKE_INSTALL_RPATH "$ORIGIN/../../../")
+        if (USING_LLD)
+            set(ONEDAL_PY_LINK_OPTIONS "-Wl,-z,noexecstack,-z,relro,-z,now")
+        else()
+            set(ONEDAL_PY_LINK_OPTIONS "-Wl,-z,noexecstack,-z,relro,-z,now,-fstack-protector-strong,-fno-strict-overflow,-fno-delete-null-pointer-checks,-fwrapv")
+        endif()
+        if(ADD_ONEDAL_RPATH)
+            set(CMAKE_INSTALL_RPATH "${oneDAL_LIBRARY_DIR}:$ORIGIN/../../../")
+            if ((IFACE STREQUAL "dpc" OR IFACE STREQUAL "spmd_dpc") AND DEFINED ENV{MKLROOT})
+                set(CMAKE_INSTALL_RPATH "$ENV{MKLROOT}/lib:${CMAKE_INSTALL_RPATH}")
+            endif()
+        else()
+            set(CMAKE_INSTALL_RPATH "$ORIGIN/../../../")
+        endif()
     endif()
     set(WARNING_FLAGS "-Winit-self")
 else()
@@ -111,6 +136,25 @@ if(IFACE STREQUAL "host")
         endif()
     endif()
 
+    if(SKLEARNEX_GCOV)
+        # Disable precompile headers as this causes issues in header coverage generation
+        set(CMAKE_DISABLE_PRECOMPILE_HEADERS ON)
+        if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM" OR CMAKE_CXX_COMPILER_ID MATCHES ".*Clang")
+            if(WIN32)
+                set(CMAKE_CXX_FLAGS "/clang:--coverage ${CMAKE_CXX_FLAGS}")
+                list(APPEND ONEDAL_LIBRARIES "clang_rt.profile-x86_64.lib")
+            else()
+                set(CMAKE_CXX_FLAGS "--coverage ${CMAKE_CXX_FLAGS}")
+                set(CMAKE_SHARED_LINKER_FLAGS "--coverage ${CMAKE_SHARED_LINKER_FLAGS}")
+            endif()
+        elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+            set(CMAKE_CXX_FLAGS "--coverage ${CMAKE_CXX_FLAGS}")
+            set(CMAKE_SHARED_LINKER_FLAGS "--coverage ${CMAKE_SHARED_LINKER_FLAGS}")
+        else()
+            message(WARNING "Code coverage will not be generated for target: host")
+        endif()
+    endif()
+
     list(APPEND COMPILE_DEFINITIONS "NPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION")
 
 elseif(IFACE_IS_DPC OR IFACE_IS_SPMD_DPC)
@@ -126,11 +170,12 @@ elseif(IFACE_IS_DPC OR IFACE_IS_SPMD_DPC)
         set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
     endif()
 
-    if(CMAKE_CXX_COMPILER MATCHES ".*icpx" OR CMAKE_CXX_COMPILER MATCHES ".*icx")
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
         set(CMAKE_CXX_FLAGS "-fsycl ${CMAKE_CXX_FLAGS}")
+        
     endif()
 
-    if(CMAKE_C_COMPILER MATCHES ".*icpx" OR CMAKE_C_COMPILER MATCHES ".*icx")
+    if(CMAKE_C_COMPILER_ID STREQUAL "IntelLLVM")
         set(CMAKE_C_FLAGS "-fsycl ${CMAKE_C_FLAGS}")
     endif()
 
@@ -158,6 +203,20 @@ elseif(IFACE_IS_DPC OR IFACE_IS_SPMD_DPC)
         endif()
     endif()
 
+    if(SKLEARNEX_GCOV)
+        # Disable precompile headers as this causes issues in header coverage generation
+        set(CMAKE_DISABLE_PRECOMPILE_HEADERS ON)
+        if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM" AND WIN32)
+            set(CMAKE_CXX_FLAGS "/clang:-Xarch_host /clang:--coverage ${CMAKE_CXX_FLAGS}")
+            list(APPEND ONEDAL_LIBRARIES "clang_rt.profile-x86_64.lib")
+        elseif(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM" AND UNIX)
+            set(CMAKE_CXX_FLAGS "-Xarch_host --coverage ${CMAKE_CXX_FLAGS}")
+            set(CMAKE_SHARED_LINKER_FLAGS "-Xarch_host --coverage ${CMAKE_SHARED_LINKER_FLAGS}")
+        else()
+            message(WARNING "Code coverage will not be generated for target: " ${IFACE})
+        endif()
+    endif()
+
     if(IFACE_IS_SPMD_DPC)
         set(MPI_LIBRARY ${MPI_LIBS})
     endif()
@@ -179,16 +238,20 @@ pybind11_add_module(${TARGET} ${sources})
 
 set(EXTERNAL_INCLUDE_DIRECTORIES
     ${PYTHON_ONEDAL}../
-    ${oneDAL_INCLUDE_DIRS}
     ${PYTHON_INCLUDE_DIR}
     ${NUMPY_INCLUDE_DIRS}
 )
 
+# SYSTEM include suppresses deprecation warnings from oneDAL's vendored SYCL headers being promoted to errors.
+set(ONEDAL_SYSTEM_INCLUDE_DIRECTORIES
+    ${oneDAL_INCLUDE_DIRS}
+)
+
 # TODO: remove this workaround when oneDAL CMake config is fixed
 if(WIN32)
-list(APPEND EXTERNAL_INCLUDE_DIRECTORIES $ENV{DALROOT}/Library/include/dal $ENV{DALROOT}/include/dal)
+list(APPEND ONEDAL_SYSTEM_INCLUDE_DIRECTORIES $ENV{DALROOT}/Library/include/dal $ENV{DALROOT}/include/dal)
 else()
-list(APPEND EXTERNAL_INCLUDE_DIRECTORIES ${oneDAL_INCLUDE_DIRS}/dal)
+list(APPEND ONEDAL_SYSTEM_INCLUDE_DIRECTORIES ${oneDAL_INCLUDE_DIRS}/dal)
 endif()
 
 set(EXTERNAL_LINK_DIRECTORIES ${PYTHON_LIBRARY_DIR} ${oneDAL_LIBRARY_DIR})
@@ -205,6 +268,7 @@ target_link_libraries(${TARGET} PUBLIC ${EXTERNAL_LINK_LIBRARIES})
 target_compile_definitions(${TARGET} PUBLIC ${COMPILE_DEFINITIONS})
 target_link_directories(${TARGET} PRIVATE ${EXTERNAL_LINK_DIRECTORIES})
 target_include_directories(${TARGET} PRIVATE ${EXTERNAL_INCLUDE_DIRECTORIES})
+target_include_directories(${TARGET} SYSTEM PRIVATE ${ONEDAL_SYSTEM_INCLUDE_DIRECTORIES})
 
 message(STATUS "NUMPY_INCLUDE_DIRS:" ${NUMPY_INCLUDE_DIRS})
 

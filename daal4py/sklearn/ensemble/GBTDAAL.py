@@ -23,7 +23,12 @@ from sklearn import preprocessing
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
 from sklearn.utils import check_random_state
 from sklearn.utils.multiclass import check_classification_targets
-from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
+from sklearn.utils.validation import (
+    check_array,
+    check_is_fitted,
+    check_X_y,
+    validate_data,
+)
 
 import daal4py as d4p
 
@@ -128,15 +133,20 @@ class GBTDAALBase(BaseEstimator, d4p.mb.GBTDAALBaseModel):
     def _more_tags(self):
         return {"allow_nan": self.allow_nan_}
 
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.input_tags.allow_nan = self.allow_nan_
+        return tags
+
 
 @control_n_jobs(decorated_methods=["fit", "predict"])
-class GBTDAALClassifier(GBTDAALBase, ClassifierMixin):
+class GBTDAALClassifier(ClassifierMixin, GBTDAALBase):
     def fit(self, X, y):
         # Check the algorithm parameters
         self._check_params()
 
         # Check that X and y have correct shape
-        X, y = check_X_y(X, y, y_numeric=False, dtype=[np.single, np.double])
+        X, y = check_X_y(X, y, y_numeric=False, dtype=[np.float64, np.float32])
 
         check_classification_targets(y)
 
@@ -193,32 +203,41 @@ class GBTDAALClassifier(GBTDAALBase, ClassifierMixin):
         # Return the classifier
         return self
 
-    def _predict(self, X, resultsToEvaluate):
-        # Input validation
-        if not self.allow_nan_:
-            X = check_array(X, dtype=[np.single, np.double])
-        else:
-            X = check_array(X, dtype=[np.single, np.double], force_all_finite="allow-nan")
-
+    def _predict(
+        self, X, resultsToEvaluate, pred_contribs=False, pred_interactions=False
+    ):
         # Check is fit had been called
         check_is_fitted(self, ["n_features_in_", "n_classes_"])
+
+        # Input validation
+        X = validate_data(
+            self,
+            X,
+            dtype=[np.float64, np.float32],
+            ensure_all_finite="allow-nan" if self.allow_nan_ else True,
+            reset=False,
+        )
 
         # Trivial case
         if self.n_classes_ == 1:
             return np.full(X.shape[0], self.classes_[0])
 
         fptype = getFPType(X)
-        predict_result = self._predict_classification(X, fptype, resultsToEvaluate)
+        predict_result = self._predict_classification(
+            X, fptype, resultsToEvaluate, pred_contribs, pred_interactions
+        )
 
-        if resultsToEvaluate == "computeClassLabels":
+        if resultsToEvaluate == "computeClassLabels" and not (
+            pred_contribs or pred_interactions
+        ):
             # Decode labels
             le = preprocessing.LabelEncoder()
             le.classes_ = self.classes_
             return le.inverse_transform(predict_result)
         return predict_result
 
-    def predict(self, X):
-        return self._predict(X, "computeClassLabels")
+    def predict(self, X, pred_contribs=False, pred_interactions=False):
+        return self._predict(X, "computeClassLabels", pred_contribs, pred_interactions)
 
     def predict_proba(self, X):
         return self._predict(X, "computeClassProbabilities")
@@ -245,13 +264,13 @@ class GBTDAALClassifier(GBTDAALBase, ClassifierMixin):
 
 
 @control_n_jobs(decorated_methods=["fit", "predict"])
-class GBTDAALRegressor(GBTDAALBase, RegressorMixin):
+class GBTDAALRegressor(RegressorMixin, GBTDAALBase):
     def fit(self, X, y):
         # Check the algorithm parameters
         self._check_params()
 
         # Check that X and y have correct shape
-        X, y = check_X_y(X, y, y_numeric=True, dtype=[np.single, np.double])
+        X, y = check_X_y(X, y, y_numeric=True, dtype=[np.float64, np.float32])
 
         # Convert to 2d array
         y_ = y.reshape((-1, 1))
@@ -291,14 +310,17 @@ class GBTDAALRegressor(GBTDAALBase, RegressorMixin):
         return self
 
     def predict(self, X, pred_contribs=False, pred_interactions=False):
-        # Input validation
-        if not self.allow_nan_:
-            X = check_array(X, dtype=[np.single, np.double])
-        else:
-            X = check_array(X, dtype=[np.single, np.double], force_all_finite="allow-nan")
-
         # Check is fit had been called
         check_is_fitted(self, ["n_features_in_"])
+
+        # Input validation
+        X = validate_data(
+            self,
+            X,
+            dtype=[np.float64, np.float32],
+            ensure_all_finite="allow-nan" if self.allow_nan_ else True,
+            reset=False,
+        )
 
         fptype = getFPType(X)
         return self._predict_regression(X, fptype, pred_contribs, pred_interactions)

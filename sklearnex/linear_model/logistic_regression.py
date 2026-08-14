@@ -15,42 +15,44 @@
 # ===============================================================================
 
 import logging
-from abc import ABC
 
-from daal4py.sklearn._utils import daal_check_version
+from daal4py.sklearn._utils import daal_check_version, sklearn_check_version
 from daal4py.sklearn.linear_model.logistic_path import (
-    LogisticRegression as LogisticRegression_daal4py,
+    LogisticRegression as _daal4py_LogisticRegression,
 )
-from daal4py.sklearn.linear_model.logistic_path import daal4py_fit, daal4py_predict
 
-
-class BaseLogisticRegression(ABC):
-    def _save_attributes(self):
-        assert hasattr(self, "_onedal_estimator")
-        self.classes_ = self._onedal_estimator.classes_
-        self.coef_ = self._onedal_estimator.coef_
-        self.intercept_ = self._onedal_estimator.intercept_
-        self.n_features_in_ = self._onedal_estimator.n_features_in_
-        self.n_iter_ = self._onedal_estimator.n_iter_
-
+from ..base import oneDALEstimator
 
 if daal_check_version((2024, "P", 1)):
     import numpy as np
     from scipy.sparse import issparse
-    from sklearn.linear_model import LogisticRegression as sklearn_LogisticRegression
+    from sklearn.linear_model import LogisticRegression as _sklearn_LogisticRegression
     from sklearn.metrics import accuracy_score
+    from sklearn.utils._array_api import get_namespace
     from sklearn.utils.multiclass import type_of_target
-    from sklearn.utils.validation import check_X_y
+    from sklearn.utils.validation import _num_samples, check_is_fitted
 
     from daal4py.sklearn._n_jobs_support import control_n_jobs
-    from daal4py.sklearn._utils import sklearn_check_version
+    from daal4py.sklearn._utils import check_is_array_api, is_sparse
+    from daal4py.sklearn.linear_model.logistic_path import daal4py_fit, daal4py_predict
     from onedal.linear_model import LogisticRegression as onedal_LogisticRegression
-    from onedal.utils import _num_samples
 
+    from .._config import get_config
     from .._device_offload import dispatch, wrap_output_data
     from .._utils import PatchingConditionsChain, get_patch_message
-    from ..utils.validation import _assert_all_finite
+    from ..utils._array_api import enable_array_api
+    from ..utils.validation import validate_data
 
+    if sklearn_check_version("1.9"):
+        from sklearn.utils._array_api import (
+            check_same_namespace,
+            get_namespace_and_device,
+            move_to,
+        )
+
+    _sparsity_enabled = daal_check_version((2024, "P", 700))
+
+    @enable_array_api
     @control_n_jobs(
         decorated_methods=[
             "fit",
@@ -60,65 +62,123 @@ if daal_check_version((2024, "P", 1)):
             "score",
         ]
     )
-    class LogisticRegression(sklearn_LogisticRegression, BaseLogisticRegression):
-        __doc__ = sklearn_LogisticRegression.__doc__
-        intercept_, coef_, n_iter_ = None, None, None
+    class LogisticRegression(oneDALEstimator, _sklearn_LogisticRegression):
+        __doc__ = _sklearn_LogisticRegression.__doc__
 
-        if sklearn_check_version("1.2"):
-            _parameter_constraints: dict = {
-                **sklearn_LogisticRegression._parameter_constraints
-            }
+        _parameter_constraints: dict = {
+            **_sklearn_LogisticRegression._parameter_constraints
+        }
 
-        def __init__(
-            self,
-            penalty="l2",
-            *,
-            dual=False,
-            tol=1e-4,
-            C=1.0,
-            fit_intercept=True,
-            intercept_scaling=1,
-            class_weight=None,
-            random_state=None,
-            solver="lbfgs",
-            max_iter=100,
-            multi_class="auto",
-            verbose=0,
-            warm_start=False,
-            n_jobs=None,
-            l1_ratio=None,
-        ):
-            super().__init__(
-                penalty=penalty,
-                dual=dual,
-                tol=tol,
-                C=C,
-                fit_intercept=fit_intercept,
-                intercept_scaling=intercept_scaling,
-                class_weight=class_weight,
-                random_state=random_state,
-                solver=solver,
-                max_iter=max_iter,
-                multi_class=multi_class,
-                verbose=verbose,
-                warm_start=warm_start,
-                n_jobs=n_jobs,
-                l1_ratio=l1_ratio,
-            )
+        if sklearn_check_version("1.8"):
 
+            def __init__(
+                self,
+                penalty="deprecated",
+                *,
+                C=1.0,
+                l1_ratio=0.0,
+                dual=False,
+                tol=1e-4,
+                fit_intercept=True,
+                intercept_scaling=1,
+                class_weight=None,
+                random_state=None,
+                solver="lbfgs",
+                max_iter=100,
+                verbose=0,
+                warm_start=False,
+                n_jobs=None,
+            ):
+                super().__init__(
+                    penalty=penalty,
+                    dual=dual,
+                    tol=tol,
+                    C=C,
+                    fit_intercept=fit_intercept,
+                    intercept_scaling=intercept_scaling,
+                    class_weight=class_weight,
+                    random_state=random_state,
+                    solver=solver,
+                    max_iter=max_iter,
+                    verbose=verbose,
+                    warm_start=warm_start,
+                    n_jobs=n_jobs,
+                    l1_ratio=l1_ratio,
+                )
+
+        else:
+
+            def __init__(
+                self,
+                penalty="l2",
+                *,
+                dual=False,
+                tol=1e-4,
+                C=1.0,
+                fit_intercept=True,
+                intercept_scaling=1,
+                class_weight=None,
+                random_state=None,
+                solver="lbfgs",
+                max_iter=100,
+                multi_class="deprecated",
+                verbose=0,
+                warm_start=False,
+                n_jobs=None,
+                l1_ratio=None,
+            ):
+                super().__init__(
+                    penalty=penalty,
+                    dual=dual,
+                    tol=tol,
+                    C=C,
+                    fit_intercept=fit_intercept,
+                    intercept_scaling=intercept_scaling,
+                    class_weight=class_weight,
+                    random_state=random_state,
+                    solver=solver,
+                    max_iter=max_iter,
+                    multi_class=multi_class,
+                    verbose=verbose,
+                    warm_start=warm_start,
+                    n_jobs=n_jobs,
+                    l1_ratio=l1_ratio,
+                )
+
+        _onedal_LogisticRegression = staticmethod(onedal_LogisticRegression)
         _onedal_cpu_fit = daal4py_fit
 
+        def _onedal_gpu_save_attributes(self):
+            assert hasattr(self, "_onedal_estimator")
+            self.coef_ = self._onedal_estimator.coef_
+            self.intercept_ = self._onedal_estimator.intercept_
+            self.n_features_in_ = self._onedal_estimator.n_features_in_
+            xp, is_array_api = get_namespace(self.coef_)
+
+            # Note that here additional transfer from CPU to GPU happens, however it is required for conformance with sklearn API
+            if is_array_api:
+                self.n_iter_ = xp.asarray(
+                    self._onedal_estimator.n_iter_,
+                    device=getattr(self.coef_, "device", None),
+                    dtype=xp.int32,
+                )
+            else:
+                self.n_iter_ = xp.asarray(
+                    self._onedal_estimator.n_iter_,
+                    dtype=xp.int32,
+                )
+
         def fit(self, X, y, sample_weight=None):
-            if sklearn_check_version("1.0"):
-                self._check_feature_names(X, reset=True)
-            if sklearn_check_version("1.2"):
-                self._validate_params()
+            self._validate_params()
+
+            if hasattr(self, "_onedal_estimator"):
+                del self._onedal_estimator
             dispatch(
                 self,
                 "fit",
                 {
                     "onedal": self.__class__._onedal_fit,
-                    "sklearn": sklearn_LogisticRegression.fit,
+                    "sklearn": _sklearn_LogisticRegression.fit,
                 },
                 X,
                 y,
@@ -128,56 +188,65 @@ if daal_check_version((2024, "P", 1)):
 
         @wrap_output_data
         def predict(self, X):
-            if sklearn_check_version("1.0"):
-                self._check_feature_names(X, reset=False)
+            check_is_fitted(self)
             return dispatch(
                 self,
                 "predict",
                 {
                     "onedal": self.__class__._onedal_predict,
-                    "sklearn": sklearn_LogisticRegression.predict,
+                    "sklearn": _sklearn_LogisticRegression.predict,
                 },
                 X,
             )
 
         @wrap_output_data
         def predict_proba(self, X):
-            if sklearn_check_version("1.0"):
-                self._check_feature_names(X, reset=False)
+            check_is_fitted(self)
             return dispatch(
                 self,
-                "predict",
+                "predict_proba",
                 {
                     "onedal": self.__class__._onedal_predict_proba,
-                    "sklearn": sklearn_LogisticRegression.predict_proba,
+                    "sklearn": _sklearn_LogisticRegression.predict_proba,
                 },
                 X,
             )
 
         @wrap_output_data
         def predict_log_proba(self, X):
-            if sklearn_check_version("1.0"):
-                self._check_feature_names(X, reset=False)
+            check_is_fitted(self)
             return dispatch(
                 self,
-                "predict",
+                "predict_log_proba",
                 {
                     "onedal": self.__class__._onedal_predict_log_proba,
-                    "sklearn": sklearn_LogisticRegression.predict_log_proba,
+                    "sklearn": _sklearn_LogisticRegression.predict_log_proba,
+                },
+                X,
+            )
+
+        @wrap_output_data
+        def decision_function(self, X):
+            check_is_fitted(self)
+            return dispatch(
+                self,
+                "decision_function",
+                {
+                    "onedal": self.__class__._onedal_decision_function,
+                    "sklearn": _sklearn_LogisticRegression.decision_function,
                 },
                 X,
             )
 
         @wrap_output_data
         def score(self, X, y, sample_weight=None):
-            if sklearn_check_version("1.0"):
-                self._check_feature_names(X, reset=False)
+            check_is_fitted(self)
             return dispatch(
                 self,
                 "score",
                 {
                     "onedal": self.__class__._onedal_score,
-                    "sklearn": sklearn_LogisticRegression.score,
+                    "sklearn": _sklearn_LogisticRegression.score,
                 },
                 X,
                 y,
@@ -189,30 +258,28 @@ if daal_check_version((2024, "P", 1)):
                 y, self._onedal_predict(X, queue=queue), sample_weight=sample_weight
             )
 
-        def _test_type_and_finiteness(self, X_in):
-            X = np.asarray(X_in)
-
-            if np.iscomplexobj(X):
-                return False
-            try:
-                _assert_all_finite(X)
-            except BaseException:
-                return False
-            return True
-
         def _onedal_gpu_fit_supported(self, method_name, *data):
             assert method_name == "fit"
             assert len(data) == 3
             X, y, sample_weight = data
-
+            xp_y, is_array_api_compliant_y = get_namespace(y)
             class_name = self.__class__.__name__
             patching_status = PatchingConditionsChain(
                 f"sklearn.linear_model.{class_name}.fit"
             )
 
-            dal_ready = patching_status.and_conditions(
+            target_type = type_of_target(y, input_name="y")
+            patching_status.and_conditions(
                 [
-                    (self.penalty == "l2", "Only l2 penalty is supported."),
+                    (
+                        self.penalty
+                        in (
+                            ["l2", "deprecated"]
+                            if sklearn_check_version("1.8")
+                            else ["l2"]
+                        ),
+                        "Only l2 penalty is supported.",
+                    ),
                     (self.dual == False, "dual=True is not supported."),
                     (
                         self.intercept_scaling == 1,
@@ -220,39 +287,45 @@ if daal_check_version((2024, "P", 1)):
                     ),
                     (self.class_weight is None, "Class weight is not supported"),
                     (self.solver == "newton-cg", "Only newton-cg solver is supported."),
-                    (
-                        self.multi_class != "multinomial",
-                        "multi_class parameter is not supported.",
-                    ),
                     (self.warm_start == False, "Warm start is not supported."),
-                    (self.l1_ratio is None, "l1 ratio is not supported."),
+                    (
+                        sklearn_check_version("1.8") or self.multi_class != "multinomial",
+                        "multi_class='multinomial is not supported.",
+                    ),
+                    (
+                        not self.l1_ratio,
+                        "l1 penalty is not supported.",
+                    ),
                     (sample_weight is None, "Sample weight is not supported."),
                     (
-                        type_of_target(y) == "binary",
+                        target_type == "binary",
                         "Only binary classification is supported",
+                    ),
+                    (
+                        (
+                            xp_y.unique_values(y)
+                            if is_array_api_compliant_y
+                            else xp_y.unique(xp_y.asarray(y))
+                        ).shape[0]
+                        == 2,
+                        "Number of classes must be equal to 2.",
                     ),
                 ]
             )
 
-            if not dal_ready:
-                return patching_status
-
-            if not patching_status.and_condition(
-                self._test_type_and_finiteness(X), "Input X is not supported."
-            ):
-                return patching_status
-
-            patching_status.and_condition(
-                self._test_type_and_finiteness(y), "Input y is not supported."
-            )
-
             return patching_status
 
+        # Note: some of these methods are implemented in pure-Python using
+        # array API. They were introduced in order to provide GPU support
+        # for methods that oneDAL didn't offer, but since the time they were
+        # introduced, scikit-learn has added array API support and these
+        # replacements are not needed anymore.
         def _onedal_gpu_predict_supported(self, method_name, *data):
             assert method_name in [
                 "predict",
                 "predict_proba",
                 "predict_log_proba",
+                "decision_function",
                 "score",
             ]
 
@@ -260,30 +333,24 @@ if daal_check_version((2024, "P", 1)):
             patching_status = PatchingConditionsChain(
                 f"sklearn.linear_model.{class_name}.{method_name}"
             )
-
             n_samples = _num_samples(data[0])
-            model_is_sparse = issparse(self.coef_) or (
-                self.fit_intercept and issparse(self.intercept_)
-            )
-            dal_ready = patching_status.and_conditions(
+            patching_status.and_conditions(
                 [
                     (n_samples > 0, "Number of samples is less than 1."),
                     (
-                        not any([issparse(i) for i in data]),
+                        (_sparsity_enabled and method_name != "decision_function")
+                        or (not any([is_sparse(i) for i in data])),
                         "Sparse input is not supported.",
                     ),
-                    (not model_is_sparse, "Sparse coefficients are not supported."),
                     (
-                        hasattr(self, "_onedal_estimator"),
-                        "oneDAL model was not trained.",
+                        self.classes_.shape[0] == 2,
+                        "Predictions supported only for binary models",
+                    ),
+                    (
+                        not issparse(self.coef_),
+                        "Predicting on sparse coefficients is not supported.",
                     ),
                 ]
-            )
-            if not dal_ready:
-                return patching_status
-
-            patching_status.and_condition(
-                self._test_type_and_finiteness(*data), "Input X is not supported."
             )
 
             return patching_status
@@ -291,7 +358,13 @@ if daal_check_version((2024, "P", 1)):
         def _onedal_gpu_supported(self, method_name, *data):
             if method_name == "fit":
                 return self._onedal_gpu_fit_supported(method_name, *data)
-            if method_name in ["predict", "predict_proba", "predict_log_proba", "score"]:
+            if method_name in [
+                "predict",
+                "predict_proba",
+                "predict_log_proba",
+                "decision_function",
+                "score",
+            ]:
                 return self._onedal_gpu_predict_supported(method_name, *data)
             raise RuntimeError(
                 f"Unknown method {method_name} in {self.__class__.__name__}"
@@ -299,85 +372,209 @@ if daal_check_version((2024, "P", 1)):
 
         def _onedal_cpu_supported(self, method_name, *data):
             class_name = self.__class__.__name__
-            patching_status = PatchingConditionsChain(
-                f"sklearn.linear_model.{class_name}.{method_name}"
-            )
 
+            patching_status = PatchingConditionsChain(
+                f"sklearn.linear_model.{class_name}.{method_name}",
+            )
+            patching_status.and_conditions(
+                [
+                    (
+                        not check_is_array_api(data[0]),
+                        "Array API inputs not supported.",
+                    )
+                ]
+            )
             return patching_status
 
-        def _initialize_onedal_estimator(self):
+        def _onedal_gpu_initialize_estimator(self, override_solver: bool = False):
+            # We need to override solver in case the model is only used for inference, since newton-cg is the only supported solver for GPU
+            # For example, if we trained model with lbfgs solver (with fall back to stock sklearn) and we want to run the inference on GPU using sklearnex code
             onedal_params = {
                 "tol": self.tol,
                 "C": self.C,
                 "fit_intercept": self.fit_intercept,
-                "solver": self.solver,
+                "solver": self.solver if not override_solver else "newton-cg",
                 "max_iter": self.max_iter,
             }
-            self._onedal_estimator = onedal_LogisticRegression(**onedal_params)
+            self._onedal_estimator = self._onedal_LogisticRegression(**onedal_params)
 
-        def _onedal_fit(self, X, y, sample_weight, queue=None):
+        def _onedal_gpu_initialize_from_coefs(self) -> None:
+            xp, _ = get_namespace(self.coef_)
+            self._onedal_gpu_initialize_estimator(override_solver=True)
+            self._onedal_estimator._create_model(self.coef_, self.intercept_, xp)
+
+        def _onedal_fit(self, X, y, sample_weight=None, queue=None):
             if queue is None or queue.sycl_device.is_cpu:
+                # TODO add array-api support for CPU
                 return self._onedal_cpu_fit(X, y, sample_weight)
-
             assert sample_weight is None
+            xp, is_array_api = get_namespace(X)
+            xp_y, is_array_api_compliant_y = get_namespace(y)
 
-            check_params = {
-                "X": X,
-                "y": y,
-                "dtype": [np.float64, np.float32],
-                "accept_sparse": False,
-                "multi_output": False,
-                "force_all_finite": True,
-            }
-            if sklearn_check_version("1.2"):
-                X, y = self._validate_data(**check_params)
-            else:
-                X, y = check_X_y(**check_params)
-            self._initialize_onedal_estimator()
-            try:
-                self._onedal_estimator.fit(X, y, queue=queue)
-                self._save_attributes()
-            except RuntimeError:
-                logging.getLogger("sklearnex").info(
-                    f"{self.__class__.__name__}.fit "
-                    + get_patch_message("sklearn_after_onedal")
+            X, y = validate_data(
+                self,
+                X,
+                y,
+                accept_sparse="csr" if _sparsity_enabled else False,
+                accept_large_sparse=_sparsity_enabled,
+                dtype=[xp.float64, xp.float32],
+            )
+
+            self.classes_ = (
+                xp_y.unique_values(y)
+                if is_array_api_compliant_y
+                else xp_y.unique(xp_y.asarray(y))
+            )
+
+            # Only binary labels are supported, we don't need to use LabelEncoder
+            if is_array_api:
+                y_bin = xp.asarray(
+                    y == self.classes_[1],
+                    dtype=xp.int32,
+                    device=getattr(X, "device", None),
                 )
+            else:
+                y_bin = xp.asarray(y == self.classes_[1], dtype=xp.int32)
 
-                del self._onedal_estimator
-                super().fit(X, y)
+            self._onedal_gpu_initialize_estimator()
+            self._onedal_estimator.fit(X, y_bin, queue=queue)
+            self._onedal_gpu_save_attributes()
+
+        # This should only be called when 'X' is on CPU
+        def _error_out_on_incompatible_devices(self, X, method_name: str) -> None:
+            # This can happen when fitting on GPU and then passing a CPU array to predict
+            if not isinstance(self.coef_, np.ndarray) and not issparse(self.coef_):
+                if sklearn_check_version("1.9"):
+                    check_same_namespace(X, self, attribute="coef_", method=method_name)
+                else:
+                    raise ValueError("Attempting to predict on incompatible device")
 
         def _onedal_predict(self, X, queue=None):
             if queue is None or queue.sycl_device.is_cpu:
+                self._error_out_on_incompatible_devices(X, "predict")
+
+                # TODO add array-api support for CPU
                 return daal4py_predict(self, X, "computeClassLabels")
 
-            X = self._validate_data(X, accept_sparse=False, reset=False)
-            assert hasattr(self, "_onedal_estimator")
-            return self._onedal_estimator.predict(X, queue=queue)
+            if sklearn_check_version("1.9"):
+                xp_y, _, device_y = get_namespace_and_device(self.classes_)
+            else:
+                xp_y, _ = get_namespace(self.classes_)
+
+            xp, _ = get_namespace(X)
+            X = validate_data(
+                self,
+                X,
+                reset=False,
+                accept_sparse="csr" if _sparsity_enabled else False,
+                accept_large_sparse=_sparsity_enabled,
+                dtype=[xp.float64, xp.float32],
+            )
+
+            if sklearn_check_version("1.9"):
+                check_same_namespace(X, self, attribute="coef_", method="predict")
+
+            if not hasattr(self, "_onedal_estimator"):
+                self._onedal_gpu_initialize_from_coefs()
+
+            # res will be the same datatype as self.classes_
+            res = self._onedal_estimator.predict(X, queue=queue, classes=self.classes_)
+
+            # We need this step for case where custom labels were used, e.g. np.array(['a', 'b'])
+            if sklearn_check_version("1.9"):
+                res = move_to(res, xp=xp_y, device=device_y)
+            y = xp_y.take(self.classes_, xp_y.reshape(res, (-1,)), axis=0)
+
+            return y
 
         def _onedal_predict_proba(self, X, queue=None):
             if queue is None or queue.sycl_device.is_cpu:
+                self._error_out_on_incompatible_devices(X, "predict_proba")
                 return daal4py_predict(self, X, "computeClassProbabilities")
 
-            X = self._validate_data(X, accept_sparse=False, reset=False)
-            assert hasattr(self, "_onedal_estimator")
-            return self._onedal_estimator.predict_proba(X, queue=queue)
+            xp, _ = get_namespace(X)
+            X = validate_data(
+                self,
+                X,
+                reset=False,
+                accept_sparse="csr" if _sparsity_enabled else False,
+                accept_large_sparse=_sparsity_enabled,
+                dtype=[xp.float64, xp.float32],
+            )
 
+            if sklearn_check_version("1.9"):
+                check_same_namespace(X, self, attribute="coef_", method="predict_proba")
+
+            if not hasattr(self, "_onedal_estimator"):
+                self._onedal_gpu_initialize_from_coefs()
+            res = self._onedal_estimator.predict_proba(X, queue=queue)
+            y = xp.reshape(res, (-1,))
+            return xp.stack([1 - y, y], axis=1)
+
+        # Note: it might at first glance appear that defining these methods is not
+        # necessary since scikit-learn's also support array API, but the sklearnex
+        # dispatcher will look at the tag for array API support in scikit-learn in
+        # order to decide whether to move the data before passing it to scikit-learn
+        # or not, and scikit-learn will not signal array API support for this class
+        # if the current parameter set for solver is unsupported on their side.
+        # Hence, these methods still need to be implemented, even though they just
+        # manipulate python objects the same way scikit-learn would do. Note that
+        # this class should not override the tag for array API support in scikit-learn,
+        # because array API support here is limited to GPU only, which could
+        # lead to issues when scikit-learn's code paths look at that tag.
         def _onedal_predict_log_proba(self, X, queue=None):
             if queue is None or queue.sycl_device.is_cpu:
+                self._error_out_on_incompatible_devices(X, "predict_log_proba")
                 return daal4py_predict(self, X, "computeClassLogProbabilities")
 
-            X = self._validate_data(X, accept_sparse=False, reset=False)
-            assert hasattr(self, "_onedal_estimator")
-            return self._onedal_estimator.predict_log_proba(X, queue=queue)
+            y_proba = self._onedal_predict_proba(X, queue)
+            xp, _ = get_namespace(X)
 
-        fit.__doc__ = sklearn_LogisticRegression.fit.__doc__
-        predict.__doc__ = sklearn_LogisticRegression.predict.__doc__
-        predict_proba.__doc__ = sklearn_LogisticRegression.predict_proba.__doc__
-        predict_log_proba.__doc__ = sklearn_LogisticRegression.predict_log_proba.__doc__
-        score.__doc__ = sklearn_LogisticRegression.score.__doc__
+            if y_proba.dtype == xp.float32:
+                min_prob = 1e-7
+                max_prob = 1.0 - 1e-7
+            else:
+                min_prob = 1e-15
+                max_prob = 1.0 - 1e-15
+
+            y_proba = xp.clip(y_proba, min_prob, max_prob)
+            return xp.log(y_proba)
+
+        def _onedal_decision_function(self, X, queue=None):
+            if queue is None or queue.sycl_device.is_cpu:
+                self._error_out_on_incompatible_devices(X, "decision_function")
+                # TODO add array-api support for CPU
+                return super().decision_function(X)
+
+            xp, _ = get_namespace(X)
+            X = validate_data(
+                self,
+                X,
+                reset=False,
+                accept_sparse="csr" if _sparsity_enabled else False,
+                accept_large_sparse=_sparsity_enabled,
+                dtype=[xp.float64, xp.float32],
+            )
+
+            if sklearn_check_version("1.9"):
+                check_same_namespace(
+                    X, self, attribute="coef_", method="decision_function"
+                )
+
+            raw = xp.matmul(X, xp.reshape(self.coef_, (-1,)))
+            if self.fit_intercept:
+                raw += self.intercept_
+            return raw
+
+        fit.__doc__ = _sklearn_LogisticRegression.fit.__doc__
+        predict.__doc__ = _sklearn_LogisticRegression.predict.__doc__
+        predict_proba.__doc__ = _sklearn_LogisticRegression.predict_proba.__doc__
+        predict_log_proba.__doc__ = _sklearn_LogisticRegression.predict_log_proba.__doc__
+        decision_function.__doc__ = _sklearn_LogisticRegression.decision_function.__doc__
+        score.__doc__ = _sklearn_LogisticRegression.score.__doc__
 
 else:
-    LogisticRegression = LogisticRegression_daal4py
+    LogisticRegression = _daal4py_LogisticRegression
 
     logging.warning(
         "Sklearnex LogisticRegression requires oneDAL version >= 2024.0.1 "

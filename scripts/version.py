@@ -15,10 +15,11 @@
 # limitations under the License.
 # ===============================================================================
 
+import os
 import re
+from ctypes.util import find_library
 from os.path import isfile
 from os.path import join as jp
-from sys import platform
 
 
 def find_defines(defines: list, file_obj):
@@ -68,3 +69,43 @@ def get_onedal_version(dal_root, version_type="release"):
                 version["__INTEL_DAAL_MINOR_BINARY__"]
             )
     return version
+
+
+def find_library_custom_paths(alias: str, dal_root: str, is_win: bool) -> bool:
+    if find_library(alias):
+        return True
+    paths_from_dal_root = (
+        [jp(dal_root, "Library", "bin")]
+        if is_win
+        else [jp(dal_root, "lib", "intel64"), jp(dal_root, "lib")]
+    )
+    for path in paths_from_dal_root:
+        if os.path.isfile(jp(path, alias)):
+            return True
+    return False
+
+
+def get_onedal_shared_libs(dal_root: str, is_win: bool) -> list[str]:
+    """Function to find which oneDAL shared libraries are available in the system"""
+    lib_names = [
+        "onedal",
+        "onedal_core",
+        "onedal_thread",
+        "onedal_dpc",
+        "onedal_parameters",
+    ]
+    major_bin_version, _ = get_onedal_version(dal_root, "binary")
+    found_libraries = []
+    for lib_name in lib_names:
+        possible_aliases = [
+            lib_name,
+            f"lib{lib_name}.so.{major_bin_version}",
+            f"lib{lib_name}.{major_bin_version}.dylib",
+            f"{lib_name}.{major_bin_version}.dll",
+        ]
+        if any(
+            find_library_custom_paths(alias, dal_root, is_win)
+            for alias in possible_aliases
+        ):
+            found_libraries.append(lib_name)
+    return found_libraries

@@ -14,4 +14,323 @@
 # limitations under the License.
 # ===============================================================================
 
-from daal4py.sklearn.utils.validation import _assert_all_finite
+import math
+import numbers
+from collections.abc import Sequence
+
+import scipy.sparse as sp
+from sklearn.utils._array_api import get_namespace
+from sklearn.utils.validation import _assert_all_finite as _sklearn_assert_all_finite
+from sklearn.utils.validation import (
+    _num_samples,
+    check_array,
+    check_non_negative,
+)
+
+from daal4py.sklearn._utils import daal_check_version, sklearn_check_version
+
+# Note: 'check_feature_names' is reimported from this file elsewhere
+from daal4py.sklearn.utils.validation import add_dispatcher_docstring, check_feature_names
+from onedal.utils.validation import is_contiguous
+
+if sklearn_check_version("1.9"):
+    from sklearn.utils.validation import _check_estimator_name
+    from sklearn.utils._array_api import get_namespace_and_device, move_to
+
+from sklearn.utils.validation import validate_data as _sklearn_validate_data
+
+from .._config import get_config as _get_config
+
+if daal_check_version((2024, "P", 700)):
+    from onedal.utils.validation import check_all_finite
+
+    def _onedal_supported_format(X, xp):
+        # data should be checked if contiguous, as oneDAL will only use contiguous
+        # data from sklearnex. Unlike other oneDAL offloading, copying the data is
+        # specifically avoided as it has a non-negligible impact on speed. In that
+        # case use native sklearn ``_assert_all_finite``
+        return X.dtype in [xp.float32, xp.float64] and is_contiguous(X)
+
+else:
+    from daal4py.utils.validation import _assert_all_finite as _d4p_assert_all_finite
+    from onedal.utils._array_api import _is_numpy_namespace
+
+    def _onedal_supported_format(X, xp):
+        # daal4py _assert_all_finite only supports numpy namespaces, use internally-
+        # defined check to validate inputs, otherwise offload to sklearn
+        return X.dtype in [xp.float32, xp.float64] and _is_numpy_namespace(xp)
+
+    def check_all_finite(X, allow_nan: bool = False) -> bool:
+        try:
+            _d4p_assert_all_finite(X, allow_nan=allow_nan)
+            return True
+        except ValueError:
+            return False
+
+
+def _sklearnex_assert_all_finite(
+    X,
+    *,
+    allow_nan=False,
+    estimator_name=None,
+    input_name="",
+):
+    # size check is an initial match to daal4py for performance reasons, can be
+    # optimized later
+    xp, _ = get_namespace(X)
+    # this is a PyTorch-specific fix, as Tensor.size is a function. It replicates `.size`
+    too_small = math.prod(X.shape) < 32768
+
+    if too_small or not _onedal_supported_format(X, xp):
+        if sklearn_check_version("1.9"):
+            _sklearn_assert_all_finite(
+                X,
+                allow_nan=allow_nan,
+                input_name=input_name,
+                estimator_name=estimator_name,
+            )
+        else:
+            _sklearn_assert_all_finite(X, allow_nan=allow_nan, input_name=input_name)
+    else:
+        # only check on onedal branch as it is already exists in sklearn's
+        if _get_config()["assume_finite"]:
+            return
+
+        all_finite = check_all_finite(
+            X,
+            allow_nan=allow_nan,
+        )
+        if not all_finite:
+            type_err = "infinity" if allow_nan else "NaN, infinity"
+            padded_input_name = input_name + " " if input_name else ""
+            msg_err = f"Input {padded_input_name}contains {type_err}."
+            if (
+                estimator_name is not None
+                and input_name == "X"
+                and not allow_nan
+                and sklearn_check_version("1.9")
+            ):
+                if xp.any(xp.isnan(X)):
+                    msg_err += (
+                        f"\n{estimator_name} does not accept missing values"
+                        " encoded as NaN natively. For supervised learning, you might want"
+                        " to consider sklearn.ensemble.HistGradientBoostingClassifier and"
+                        " Regressor which accept missing values encoded as NaNs natively."
+                        " Alternatively, it is possible to preprocess the data, for"
+                        " instance by using an imputer transformer in a pipeline or drop"
+                        " samples with missing values. See"
+                        " https://scikit-learn.org/stable/modules/impute.html"
+                        " You can find a list of all estimators that handle NaN values"
+                        " at the following page:"
+                        " https://scikit-learn.org/stable/modules/impute.html"
+                        "#estimators-that-handle-nan-values"
+                    )
+            raise ValueError(msg_err)
+
+
+if sklearn_check_version("1.9"):
+
+    def assert_all_finite(
+        X,
+        *,
+        allow_nan=False,
+        estimator_name=None,
+        input_name="",
+    ):
+        _sklearnex_assert_all_finite(
+            X.data if sp.issparse(X) else X,
+            allow_nan=allow_nan,
+            input_name=input_name,
+            estimator_name=estimator_name,
+        )
+
+else:
+
+    def assert_all_finite(
+        X,
+        *,
+        allow_nan=False,
+        input_name="",
+    ):
+        _sklearnex_assert_all_finite(
+            X.data if sp.issparse(X) else X,
+            allow_nan=allow_nan,
+            input_name=input_name,
+        )
+
+
+@add_dispatcher_docstring(_sklearn_validate_data)
+def validate_data(
+    _estimator,
+    /,
+    X="no_validation",
+    y="no_validation",
+    **kwargs,
+):
+    # force finite check to not occur in sklearn, default is True
+    ensure_all_finite = kwargs.pop("ensure_all_finite", True)
+    kwargs["ensure_all_finite"] = False
+
+    out = _sklearn_validate_data(
+        _estimator,
+        X=X,
+        y=y,
+        **kwargs,
+    )
+
+    check_x = not isinstance(X, str) or X != "no_validation"
+    check_y = not (y is None or isinstance(y, str) and y == "no_validation")
+
+    if ensure_all_finite:
+        # run local finite check
+        allow_nan = ensure_all_finite == "allow-nan"
+        if sklearn_check_version("1.9"):
+            kwargs_assert_all_finite = {
+                "estimator_name": _check_estimator_name(_estimator)
+            }
+        else:
+            kwargs_assert_all_finite = {}
+        # the return object from validate_data can be a single
+        # element (either x or y) or both (as a tuple). An iterator along with
+        # check_x and check_y can go through the output properly without
+        # stacking layers of if statements to make sure the proper input_name
+        # is used
+        arg = iter(out if isinstance(out, tuple) else (out,))
+        if check_x:
+            assert_all_finite(
+                next(arg), allow_nan=allow_nan, input_name="X", **kwargs_assert_all_finite
+            )
+        if check_y:
+            assert_all_finite(
+                next(arg), allow_nan=allow_nan, input_name="y", **kwargs_assert_all_finite
+            )
+
+    if check_y and kwargs.get("y_numeric", False):
+        # validate_data does not do full dtype conversions, as it uses check_X_y
+        # oneDAL can make tables from [int32, float32, float64], requiring
+        # a dtype check and conversion. This will query the array_namespace and
+        # convert y as necessary. This is important especially for regressors.
+        outx, outy = out if check_x else (None, out)
+        if outx is not None and sklearn_check_version("1.9"):
+            yp, _, device = get_namespace_and_device(outx)
+            outy = move_to(outy, xp=yp, device=device)
+            out = outx, outy
+        else:
+            yp, _ = get_namespace(outy)
+
+        # avoid using ``kwargs.get("dtype")`` as it will always set up the default
+        dtype = kwargs.get("dtype", (yp.float64, yp.float32, yp.int32))
+        if not isinstance(dtype, Sequence):
+            dtype = tuple(dtype)
+
+        if outy.dtype not in dtype:
+            # use asarray rather than astype because of numpy support
+            outy = yp.asarray(outy, dtype=dtype[0])
+            out = (outx, outy) if check_x else outy
+
+    return out
+
+
+if sklearn_check_version("1.9"):
+
+    def _check_sample_weight(
+        sample_weight,
+        X,
+        dtype=None,
+        copy=False,
+        ensure_non_negative=False,
+        allow_all_zero_weights=False,
+    ):
+        return _check_sample_weight_internal(
+            sample_weight,
+            X,
+            dtype=dtype,
+            copy=copy,
+            ensure_non_negative=ensure_non_negative,
+            allow_all_zero_weights=allow_all_zero_weights,
+        )
+
+else:
+
+    def _check_sample_weight(
+        sample_weight,
+        X,
+        dtype=None,
+        copy=False,
+        ensure_non_negative=False,
+        allow_all_zero_weights=True,
+    ):
+        return _check_sample_weight_internal(
+            sample_weight,
+            X,
+            dtype=dtype,
+            copy=copy,
+            ensure_non_negative=ensure_non_negative,
+            allow_all_zero_weights=allow_all_zero_weights,
+        )
+
+
+def _check_sample_weight_internal(
+    sample_weight,
+    X,
+    dtype=None,
+    copy=False,
+    ensure_non_negative=False,
+    allow_all_zero_weights=False,
+):
+    n_samples = _num_samples(X)
+    if sklearn_check_version("1.9"):
+        xp, _, device = get_namespace_and_device(X)
+    else:
+        xp, _ = get_namespace(X)
+        device = getattr(X, "device", None)
+
+    if dtype is not None and dtype not in [xp.float32, xp.float64]:
+        dtype = xp.float64
+
+    if sample_weight is None:
+        if device is not None:
+            sample_weight = xp.ones(n_samples, dtype=dtype, device=device)
+        else:
+            sample_weight = xp.ones(n_samples, dtype=dtype)
+    elif isinstance(sample_weight, numbers.Number):
+        if device is not None:
+            sample_weight = xp.full(n_samples, sample_weight, dtype=dtype, device=device)
+        else:
+            sample_weight = xp.full(n_samples, sample_weight, dtype=dtype)
+    else:
+        if dtype is None:
+            dtype = [xp.float64, xp.float32]
+        if sklearn_check_version("1.9"):
+            sample_weight = move_to(sample_weight, xp=xp, device=device)
+
+        sample_weight = check_array(
+            sample_weight,
+            accept_sparse=False,
+            ensure_2d=False,
+            dtype=dtype,
+            order="C",
+            copy=copy,
+            ensure_all_finite=False,
+            input_name="sample_weight",
+        )
+        assert_all_finite(sample_weight, input_name="sample_weight")
+
+        if sample_weight.ndim != 1:
+            raise ValueError("Sample weights must be 1D array or scalar")
+
+        if sample_weight.shape != (n_samples,):
+            raise ValueError(
+                "sample_weight.shape == {}, expected {}!".format(
+                    sample_weight.shape, (n_samples,)
+                )
+            )
+
+    if not allow_all_zero_weights:
+        if xp.all(sample_weight == 0):
+            raise ValueError("Sample weights must contain at least one non-zero number.")
+
+    if ensure_non_negative:
+        check_non_negative(sample_weight, "`sample_weight`")
+
+    return sample_weight

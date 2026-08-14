@@ -25,7 +25,7 @@ schedules:
 variables:
   COVERITY_TOOL_HOME: $(Agent.BuildDirectory)/cov-analysis
   DESCRIPTION: Nightly
-  python.version: '3.10'
+  python.version: '3.12'
   PYTHON: 'python'
   ARGS: '1'
   SELECTED_TESTS: 'all'
@@ -34,7 +34,7 @@ variables:
 jobs:
 - job: Coverity
   pool:
-    vmImage: 'ubuntu-latest'
+    vmImage: 'ubuntu-24.04'
   steps:
   - script: |
       cd $(Agent.BuildDirectory)
@@ -45,7 +45,15 @@ jobs:
     displayName: 'Install Coverity tool'
   - script: |
       cd $(Build.Repository.LocalPath)
-      $(COVERITY_TOOL_HOME)/bin/cov-build --dir cov-int --no-command --fs-capture-search .
+      conda config --append channels conda-forge
+      conda config --set channel_priority strict
+      conda update -y -q conda
+      conda create -y -q -n CB -c conda-forge python=$(python.version) dal-devel impi-devel pip setuptools wheel
+      . /usr/share/miniconda/etc/profile.d/conda.sh
+      conda activate CB
+      pip install -r dependencies-dev
+      export DALROOT=$CONDA_PREFIX
+      $(COVERITY_TOOL_HOME)/bin/coverity capture --project-dir . --dir cov-int --language python
       zip -r daal4py.zip cov-int
     displayName: 'Perform Coverity scan'
   - script: |
@@ -58,11 +66,13 @@ jobs:
 - job: Jupyter
   timeoutInMinutes: 0
   pool:
-    vmImage: 'ubuntu-latest'
+    vmImage: 'ubuntu-24.04'
   steps:
   - script: |
+      conda config --show channels
+      conda config --append channels conda-forge
       conda update -y -q conda
-      conda create -y -q -n CB -c intel python=$(python.version) dal-devel impi-devel
+      conda create -y -q -n CB -c conda-forge python=$(python.version) dal-devel impi-devel pip setuptools wheel
     displayName: 'Conda create'
   - script: |
       bash .ci/scripts/describe_system.sh
@@ -73,20 +83,20 @@ jobs:
       pip install -r dependencies-dev
       pip install -r requirements-doc.txt
       pip install -r requirements-test.txt
-      pip install jupyter matplotlib requests
+      pip install jupyter matplotlib requests openml
     displayName: 'Install requirements'
   - script: |
       . /usr/share/miniconda/etc/profile.d/conda.sh
       conda activate CB
       export DALROOT=$CONDA_PREFIX
       ./conda-recipe/build.sh
-      python setup_sklearnex.py install --single-version-externally-managed --record=record.txt
     displayName: 'Build daal4py/sklearnex'
   - script: |
       . /usr/share/miniconda/etc/profile.d/conda.sh
       conda activate CB
       cd examples/notebooks
-      jupyter nbconvert --execute --ExecutePreprocessor.timeout=10900 --to notebook $(ls | grep -E '.*\.ipynb' | grep -v "dbscan.*")
+      # Validate notebooks except dbscan (memory consumption) and ridge higgs (long execution/conversion time)
+      jupyter nbconvert --execute --ExecutePreprocessor.timeout=10900 --to notebook $(ls | grep -E '.*\.ipynb' | grep -v "dbscan" | grep -v "higgs" | grep -v "yolanda")
     timeoutInMinutes: 180
     displayName: 'Run jupyter notebook demo'
 
@@ -94,21 +104,21 @@ jobs:
   timeoutInMinutes: 120
   strategy:
     matrix:
-      Python3.11_SklearnMain:
-        PYTHON_VERSION: '3.11'
+      Python3.14_SklearnMain:
+        PYTHON_VERSION: '3.14'
         SKLEARN_VERSION: 'main'
   pool:
-    vmImage: 'ubuntu-22.04'
+    vmImage: 'ubuntu-24.04'
   steps:
   - template: build-and-test-lnx.yml
 - job: WindowsNightly
   timeoutInMinutes: 120
   strategy:
     matrix:
-      Python3.11_SklearnMain:
-        PYTHON_VERSION: '3.11'
+      Python3.14_SklearnMain:
+        PYTHON_VERSION: '3.14'
         SKLEARN_VERSION: 'main'
   pool:
-    vmImage: 'windows-latest'
+    vmImage: 'windows-2022'
   steps:
   - template: build-and-test-win.yml

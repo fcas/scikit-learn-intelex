@@ -13,28 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===============================================================================
+
 import numpy as np
 
-from daal4py.sklearn._utils import daal_check_version, get_dtype, make2d
-from onedal import _backend
-
-from ..datatypes import _convert_to_supported, from_table, to_table
-from ..utils import _check_array
+from .. import onedal_check_version
+from .._device_offload import supports_queue
+from ..common._backend import bind_default_backend
+from ..datatypes import from_table, return_type_constructor, to_table
+from ..utils import _sycl_queue_manager as QM
 from .covariance import BaseEmpiricalCovariance
 
 
 class IncrementalEmpiricalCovariance(BaseEmpiricalCovariance):
-    """
-    Covariance estimator based on oneDAL implementation.
+    """Covariance estimator based on oneDAL implementation.
 
     Computes sample covariance matrix.
 
     Parameters
     ----------
-    method : string, default="dense"
+    method : str, default="dense"
         Specifies computation method. Available methods: "dense".
 
-    bias: bool, default=False
+    bias : bool, default=False
         If True biased estimation of covariance is computed which equals to
         the unbiased one multiplied by (n_samples - 1) / n_samples.
 
@@ -56,16 +56,37 @@ class IncrementalEmpiricalCovariance(BaseEmpiricalCovariance):
     def __init__(self, method="dense", bias=False, assume_centered=False):
         super().__init__(method, bias, assume_centered)
         self._reset()
+        self._queue = None
+
+    @bind_default_backend("covariance")
+    def partial_compute(self, params, partial_result, X_table): ...
+
+    @bind_default_backend("covariance")
+    def partial_compute_result(self): ...
+
+    @bind_default_backend("covariance")
+    def finalize_compute(self, params, partial_result): ...
 
     def _reset(self):
-        self._partial_result = self._get_backend(
-            "covariance", None, "partial_compute_result"
-        )
+        self._need_to_finalize = False
+        self._queue = None
+        self._outtype = None
+        self._partial_result = self.partial_compute_result()
 
+    def __getstate__(self):
+        # Since finalize_fit can't be dispatched without directly provided queue
+        # and the dispatching policy can't be serialized, the computation is finalized
+        # here and the policy is not saved in serialized data.
+
+        self.finalize_fit()
+        data = self.__dict__.copy()
+        data.pop("_queue", None)
+
+        return data
+
+    @supports_queue
     def partial_fit(self, X, y=None, queue=None):
-        """
-        Computes partial data for the covariance matrix
-        from data batch X and saves it to `_partial_result`.
+        """Generate partial covariance from batch data in `_partial_result`.
 
         Parameters
         ----------
@@ -76,66 +97,51 @@ class IncrementalEmpiricalCovariance(BaseEmpiricalCovariance):
         y : Ignored
             Not used, present for API consistency by convention.
 
-        queue : dpctl.SyclQueue
-            If not None, use this queue for computations.
+        queue : SyclQueue or None, default=None
+            If not None, use this queue for computation.
 
         Returns
         -------
         self : object
             Returns the instance itself.
         """
-        X = _check_array(X, dtype=[np.float64, np.float32], ensure_2d=True)
 
-        if not hasattr(self, "_policy"):
-            self._policy = self._get_policy(queue, X)
-
-        X = _convert_to_supported(self._policy, X)
+        self._queue = queue
+        if not self._outtype:
+            self._outtype = return_type_constructor(X)
+        X_table = to_table(X, queue=queue)
 
         if not hasattr(self, "_dtype"):
-            self._dtype = get_dtype(X)
+            self._dtype = X_table.dtype
 
         params = self._get_onedal_params(self._dtype)
-        table_X = to_table(X)
-        self._partial_result = self._get_backend(
-            "covariance",
-            None,
-            "partial_compute",
-            self._policy,
-            params,
-            self._partial_result,
-            table_X,
-        )
+        self._partial_result = self.partial_compute(params, self._partial_result, X_table)
+        self._need_to_finalize = True
 
-    def finalize_fit(self, queue=None):
-        """
-        Finalizes covariance matrix and obtains `covariance_` and `location_`
-        attributes from the current `_partial_result`.
+    def finalize_fit(self):
+        """Finalize covariance matrix from the current `_partial_result`.
 
-        Parameters
-        ----------
-        queue : dpctl.SyclQueue
-            Not used here, added for API conformance
+        Results are stored in `location_` and `covariance_` attributes.
 
         Returns
         -------
         self : object
             Returns the instance itself.
         """
-        params = self._get_onedal_params(self._dtype)
-        result = self._get_backend(
-            "covariance",
-            None,
-            "finalize_compute",
-            self._policy,
-            params,
-            self._partial_result,
-        )
-        if daal_check_version((2024, "P", 1)) or (not self.bias):
-            self.covariance_ = from_table(result.cov_matrix)
-        else:
-            n_rows = self._partial_result.partial_n_rows
-            self.covariance_ = from_table(result.cov_matrix) * (n_rows - 1) / n_rows
+        if self._need_to_finalize:
+            params = self._get_onedal_params(self._dtype)
+            with QM.manage_global_queue(self._queue):
+                result = self.finalize_compute(params, self._partial_result)
 
-        self.location_ = from_table(result.means).ravel()
+            self.covariance_ = from_table(result.cov_matrix, like=self._outtype)
+
+            if self.bias and not onedal_check_version(2024, 0, 1):
+                n_rows = self._partial_result.partial_n_rows
+                self.covariance_ *= (n_rows - 1) / n_rows
+
+            self.location_ = from_table(result.means, like=self._outtype)[0, ...]
+            self._outtype = None
+
+            self._need_to_finalize = False
 
         return self

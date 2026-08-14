@@ -32,7 +32,9 @@ __all__ = [
     "basic_statistics",
     "cluster",
     "config_context",
+    "covariance",
     "decomposition",
+    "dummy",
     "ensemble",
     "get_config",
     "get_hyperparameters",
@@ -45,20 +47,19 @@ __all__ = [
     "model_selection",
     "neighbors",
     "patch_sklearn",
+    "reset_hyperparameters",
     "set_config",
     "sklearn_is_patched",
     "svm",
     "unpatch_sklearn",
     "utils",
 ]
-onedal_iface_flag = os.environ.get("OFF_ONEDAL_IFACE", "0")
-if onedal_iface_flag == "0":
-    from onedal import _is_spmd_backend
-    from onedal.common.hyperparameters import get_hyperparameters
+__version__ = "2199.9.9"
+from onedal import _spmd_backend
+from onedal.common.hyperparameters import get_hyperparameters, reset_hyperparameters
 
-    if _is_spmd_backend:
-        __all__.append("spmd")
-
+if _spmd_backend is not None:
+    __all__.append("spmd")
 
 from ._utils import set_sklearn_ex_verbose
 

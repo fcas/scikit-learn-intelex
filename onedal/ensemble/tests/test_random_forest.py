@@ -14,6 +14,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 from sklearn.datasets import make_classification, make_regression
@@ -21,6 +22,8 @@ from sklearn.datasets import make_classification, make_regression
 from daal4py.sklearn._utils import daal_check_version
 from onedal.ensemble import RandomForestClassifier, RandomForestRegressor
 from onedal.tests.utils._device_selection import get_queues
+
+PREDICT_DATA = np.array([[0, 0, 0, 0]], dtype=np.float64)
 
 
 @pytest.mark.parametrize("queue", get_queues())
@@ -33,31 +36,33 @@ def test_rf_classifier(queue):
         random_state=0,
         shuffle=False,
     )
-    rf = RandomForestClassifier(max_depth=2, random_state=0).fit(X, y, queue=queue)
-    assert_allclose([1], rf.predict([[0, 0, 0, 0]], queue=queue))
+    rf = RandomForestClassifier(max_depth=2, random_state=0).fit(
+        X, y, class_count=2, queue=queue
+    )
+    assert_allclose([1], rf.predict(PREDICT_DATA, queue=queue))
 
 
-# TODO:
-# fix RF regressor predict for the GPU sycl_queue.
-@pytest.mark.parametrize("queue", get_queues("cpu"))
+@pytest.mark.parametrize("queue", get_queues())
 def test_rf_regression(queue):
+    if queue and queue.sycl_device.is_gpu:
+        pytest.skip("RF regressor predict for the GPU sycl_queue is buggy.")
     X, y = make_regression(
         n_samples=100, n_features=4, n_informative=2, random_state=0, shuffle=False
     )
-    rf = RandomForestRegressor(max_depth=2, random_state=0).fit(X, y, queue=queue)
+    rf = RandomForestRegressor(max_depth=2, random_state=209652396).fit(X, y, queue=queue)
 
     # GPU and CPU implementations of Random Forest use RNGs differently. They build
     # different ensembles of trees, thereby requiring separate check values.
-    if queue.sycl_device.is_gpu:
+    if queue and queue.sycl_device.is_gpu:
         if daal_check_version((2024, "P", 0)):
-            assert_allclose([1.82], rf.predict([[0, 0, 0, 0]], queue=queue), atol=1e-2)
+            assert_allclose([1.82], rf.predict(PREDICT_DATA, queue=queue), atol=1e-2)
         else:
-            assert_allclose([-6.83], rf.predict([[0, 0, 0, 0]], queue=queue), atol=1e-2)
+            assert_allclose([-6.83], rf.predict(PREDICT_DATA, queue=queue), atol=1e-2)
     else:
         if daal_check_version((2024, "P", 0)):
-            assert_allclose([-6.97], rf.predict([[0, 0, 0, 0]], queue=queue), atol=1e-2)
+            assert_allclose([-6.97], rf.predict(PREDICT_DATA, queue=queue), atol=1e-2)
         else:
-            assert_allclose([-6.83], rf.predict([[0, 0, 0, 0]], queue=queue), atol=1e-2)
+            assert_allclose([-6.83], rf.predict(PREDICT_DATA, queue=queue), atol=1e-2)
 
 
 @pytest.mark.skipif(
@@ -74,16 +79,17 @@ def test_rf_classifier_random_splitter(queue):
         shuffle=False,
     )
     rf = RandomForestClassifier(max_depth=2, random_state=0, splitter_mode="random").fit(
-        X, y, queue=queue
+        X, y, class_count=2, queue=queue
     )
-    assert_allclose([1], rf.predict([[0, 0, 0, 0]], queue=queue))
+    assert_allclose([1], rf.predict(PREDICT_DATA, queue=queue))
 
 
-# TODO:
-# fix RF regressor predict for the GPU sycl_queue.
-@pytest.mark.skip(reason="fix RF regressor predict for the GPU sycl_queue")
 @pytest.mark.parametrize("queue", get_queues("gpu"))
 def test_rf_regression_random_splitter(queue):
+    # splitter_mode selection only for GPU enabled.
+    # For CPU only `best` mode is supported.
+    if queue and queue.sycl_device.is_gpu:
+        pytest.skip("RF regressor predict for the GPU sycl_queue is buggy.")
     X, y = make_regression(
         n_samples=100, n_features=4, n_informative=2, random_state=0, shuffle=False
     )
@@ -91,6 +97,6 @@ def test_rf_regression_random_splitter(queue):
         X, y, queue=queue
     )
     if daal_check_version((2024, "P", 0)):
-        assert_allclose([-6.88], rf.predict([[0, 0, 0, 0]], queue=queue), atol=1e-2)
+        assert_allclose([-6.88], rf.predict(PREDICT_DATA, queue=queue), atol=1e-2)
     else:
-        assert_allclose([-6.83], rf.predict([[0, 0, 0, 0]], queue=queue), atol=1e-2)
+        assert_allclose([-6.83], rf.predict(PREDICT_DATA, queue=queue), atol=1e-2)

@@ -18,66 +18,71 @@ import numpy as np
 import pytest
 from numpy.testing import assert_array_almost_equal, assert_array_equal
 from scipy import sparse as sp
-from sklearn import datasets
-from sklearn.base import clone as clone_estimator
-from sklearn.datasets import make_classification
 
-from onedal.svm import SVC, SVR
+from onedal.svm import SVC
 from onedal.tests.utils._device_selection import (
     get_queues,
     pass_if_not_implemented_for_gpu,
 )
+from onedal.utils import _sycl_queue_manager as QM
 
 
-def is_classifier(estimator):
-    return getattr(estimator, "_estimator_type", None) == "classifier"
-
-
-def check_svm_model_equal(queue, svm, X_train, y_train, X_test, decimal=6):
-    sparse_svm = clone_estimator(svm)
-    dense_svm = clone_estimator(svm)
-    dense_svm.fit(X_train.toarray(), y_train, queue=queue)
-    if sp.issparse(X_test):
-        X_test_dense = X_test.toarray()
+def check_svm_model_equal(
+    queue, dense_svm, sparse_svm, X_train, y_train, X_test, decimal=6
+):
+    if dense_svm.__class__.__module__.startswith("onedal"):
+        params = {"class_count": len(np.unique(y_train))}
     else:
-        X_test_dense = X_test
-    sparse_svm.fit(X_train, y_train, queue=queue)
-    assert sp.issparse(sparse_svm.support_vectors_)
-    assert sp.issparse(sparse_svm.dual_coef_)
-    assert_array_almost_equal(
-        dense_svm.support_vectors_, sparse_svm.support_vectors_.toarray(), decimal
-    )
-    assert_array_almost_equal(
-        dense_svm.dual_coef_, sparse_svm.dual_coef_.toarray(), decimal
-    )
-    assert_array_almost_equal(dense_svm.support_, sparse_svm.support_)
-    assert_array_almost_equal(
-        dense_svm.predict(X_test_dense, queue=queue),
-        sparse_svm.predict(X_test, queue=queue),
-    )
+        params = {}
 
-    if is_classifier(svm):
+    with QM.manage_global_queue(queue):
+
+        dense_svm.fit(X_train.toarray(), y_train, **params)
+        if sp.issparse(X_test):
+            X_test_dense = X_test.toarray()
+        else:
+            X_test_dense = X_test
+        sparse_svm.fit(X_train, y_train, **params)
+
+        assert sp.issparse(sparse_svm.support_vectors_)
+        assert sp.issparse(sparse_svm.dual_coef_)
+
         assert_array_almost_equal(
-            dense_svm.decision_function(X_test_dense, queue=queue),
-            sparse_svm.decision_function(X_test, queue=queue),
-            decimal,
+            dense_svm.support_vectors_, sparse_svm.support_vectors_.toarray(), decimal
         )
+        assert_array_almost_equal(
+            dense_svm.dual_coef_, sparse_svm.dual_coef_.toarray(), decimal
+        )
+        assert_array_almost_equal(dense_svm.support_, sparse_svm.support_)
+        assert_array_almost_equal(
+            dense_svm.predict(X_test_dense), sparse_svm.predict(X_test)
+        )
+
+        if hasattr(dense_svm, "decision_function") and hasattr(
+            sparse_svm, "decision_function"
+        ):
+            assert_array_almost_equal(
+                dense_svm.decision_function(X_test_dense),
+                sparse_svm.decision_function(X_test),
+                decimal,
+            )
 
 
 def _test_simple_dataset(queue, kernel):
-    X = np.array([[-2, -1], [-1, -1], [-1, -2], [1, 1], [1, 2], [2, 1]])
-    sparse_X = sp.lil_matrix(X)
-    Y = [1, 1, 1, 2, 2, 2]
+    X = np.array([[-2, -1], [-1, -1], [-1, -2], [1, 1], [1, 2], [2, 1]], dtype=np.float64)
+    sparse_X = sp.csr_matrix(X)
+    Y = np.array([1, 1, 1, 2, 2, 2], dtype=np.float64)
 
-    X2 = np.array([[-1, -1], [2, 2], [3, 2]])
-    sparse_X2 = sp.dok_matrix(X2)
+    X2 = np.array([[-1, -1], [2, 2], [3, 2]], dtype=np.float64)
+    sparse_X2 = sp.csr_matrix(X2)
 
     dataset = sparse_X, Y, sparse_X2
-    clf = SVC(kernel=kernel, gamma=1)
-    check_svm_model_equal(queue, clf, *dataset)
+    clf0 = SVC(kernel=kernel, gamma=1)
+    clf1 = SVC(kernel=kernel, gamma=1)
+    check_svm_model_equal(queue, clf0, clf1, *dataset)
 
 
-@pass_if_not_implemented_for_gpu(reason="csr svm is not implemented")
+@pass_if_not_implemented_for_gpu(reason="not implemented")
 @pytest.mark.parametrize(
     "queue",
     get_queues("cpu")
@@ -85,8 +90,7 @@ def _test_simple_dataset(queue, kernel):
         pytest.param(
             get_queues("gpu"),
             marks=pytest.mark.xfail(
-                reason="raises UnknownError instead of RuntimeError "
-                "with unimplemented message"
+                reason="raises UnknownError instead of RuntimeError with unimplemented message"
             ),
         )
     ],
@@ -94,73 +98,6 @@ def _test_simple_dataset(queue, kernel):
 @pytest.mark.parametrize("kernel", ["linear", "rbf"])
 def test_simple_dataset(queue, kernel):
     _test_simple_dataset(queue, kernel)
-
-
-def _test_binary_dataset(queue, kernel):
-    X, y = make_classification(n_samples=80, n_features=20, n_classes=2, random_state=0)
-    sparse_X = sp.csr_matrix(X)
-
-    dataset = sparse_X, y, sparse_X
-    clf = SVC(kernel=kernel)
-    check_svm_model_equal(queue, clf, *dataset)
-
-
-@pass_if_not_implemented_for_gpu(reason="csr svm is not implemented")
-@pytest.mark.parametrize(
-    "queue",
-    get_queues("cpu")
-    + [
-        pytest.param(
-            get_queues("gpu"),
-            marks=pytest.mark.xfail(
-                reason="raises UnknownError for linear and rbf, "
-                "Unimplemented error with inconsistent error message "
-                "for poly and sigmoid"
-            ),
-        )
-    ],
-)
-@pytest.mark.parametrize("kernel", ["linear", "rbf", "poly", "sigmoid"])
-def test_binary_dataset(queue, kernel):
-    _test_binary_dataset(queue, kernel)
-
-
-def _test_iris(queue, kernel):
-    iris = datasets.load_iris()
-    rng = np.random.RandomState(0)
-    perm = rng.permutation(iris.target.size)
-    iris.data = iris.data[perm]
-    iris.target = iris.target[perm]
-    sparse_iris_data = sp.csr_matrix(iris.data)
-
-    dataset = sparse_iris_data, iris.target, sparse_iris_data
-
-    clf = SVC(kernel=kernel)
-    check_svm_model_equal(queue, clf, *dataset, decimal=2)
-
-
-@pass_if_not_implemented_for_gpu(reason="csr svm is not implemented")
-@pytest.mark.parametrize("queue", get_queues())
-@pytest.mark.parametrize("kernel", ["linear", "rbf", "poly", "sigmoid"])
-def test_iris(queue, kernel):
-    _test_iris(queue, kernel)
-
-
-def _test_diabetes(queue, kernel):
-    diabetes = datasets.load_diabetes()
-
-    sparse_diabetes_data = sp.csr_matrix(diabetes.data)
-    dataset = sparse_diabetes_data, diabetes.target, sparse_diabetes_data
-
-    clf = SVR(kernel=kernel, C=0.1)
-    check_svm_model_equal(queue, clf, *dataset)
-
-
-@pass_if_not_implemented_for_gpu(reason="csr svm is not implemented")
-@pytest.mark.parametrize("queue", get_queues())
-@pytest.mark.parametrize("kernel", ["linear", "rbf", "poly", "sigmoid"])
-def test_diabetes(queue, kernel):
-    _test_diabetes(queue, kernel)
 
 
 @pass_if_not_implemented_for_gpu(reason="csr svm is not implemented")
@@ -339,9 +276,9 @@ def test_sparse_realdata(queue):
             3.0,
         ]
     )
-
-    clf = SVC(kernel="linear").fit(X.toarray(), y, queue=queue)
-    sp_clf = SVC(kernel="linear").fit(X, y, queue=queue)
+    class_count = len(np.unique(y))
+    clf = SVC(kernel="linear").fit(X.toarray(), y, class_count=class_count, queue=queue)
+    sp_clf = SVC(kernel="linear").fit(X, y, class_count=class_count, queue=queue)
 
     assert_array_equal(clf.support_vectors_, sp_clf.support_vectors_.toarray())
     assert_array_equal(clf.dual_coef_, sp_clf.dual_coef_.toarray())

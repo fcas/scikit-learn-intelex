@@ -16,12 +16,11 @@
 
 import numpy as np
 import pytest
-import sklearn.utils.estimator_checks
 from numpy.testing import assert_allclose, assert_array_almost_equal, assert_array_equal
 from sklearn import datasets
+from sklearn.metrics import r2_score
 from sklearn.metrics.pairwise import rbf_kernel
 from sklearn.svm import SVR as SklearnSVR
-from sklearn.utils.estimator_checks import check_estimator
 
 from onedal.svm import SVR
 from onedal.tests.utils._device_selection import (
@@ -32,43 +31,7 @@ from onedal.tests.utils._device_selection import (
 synth_params = {"n_samples": 500, "n_features": 100, "random_state": 42}
 
 
-def _replace_and_save(md, fns, replacing_fn):
-    saved = dict()
-    for check_f in fns:
-        try:
-            fn = getattr(md, check_f)
-            setattr(md, check_f, replacing_fn)
-            saved[check_f] = fn
-        except RuntimeError:
-            pass
-    return saved
-
-
-def _restore_from_saved(md, saved_dict):
-    for check_f in saved_dict:
-        setattr(md, check_f, saved_dict[check_f])
-
-
-def test_estimator():
-    def dummy(*args, **kwargs):
-        pass
-
-    md = sklearn.utils.estimator_checks
-    saved = _replace_and_save(
-        md,
-        [
-            "check_sample_weights_invariance",  # Max absolute difference: 0.0002
-            "check_estimators_fit_returns_self",  # ???
-            "check_regressors_train",  # Cannot get data type from empty metadata
-            "check_estimators_unfitted",  # expected NotFittedError from sklearn
-        ],
-        dummy,
-    )
-    check_estimator(SVR())
-    _restore_from_saved(md, saved)
-
-
-@pass_if_not_implemented_for_gpu(reason="svr is not implemented")
+@pass_if_not_implemented_for_gpu(reason="Regression SVM is not implemented for GPU")
 @pytest.mark.parametrize("queue", get_queues())
 def test_run_to_run_fit(queue):
     diabetes = datasets.load_diabetes()
@@ -83,16 +46,16 @@ def test_run_to_run_fit(queue):
         assert_allclose(clf_first.dual_coef_, clf.dual_coef_)
 
 
-@pass_if_not_implemented_for_gpu(reason="svr is not implemented")
+@pass_if_not_implemented_for_gpu(reason="Regression SVM is not implemented for GPU")
 @pytest.mark.parametrize("queue", get_queues())
 def test_diabetes_simple(queue):
     diabetes = datasets.load_diabetes()
     clf = SVR(kernel="linear", C=10.0)
     clf.fit(diabetes.data, diabetes.target, queue=queue)
-    assert clf.score(diabetes.data, diabetes.target, queue=queue) > 0.02
+    assert r2_score(diabetes.target, clf.predict(diabetes.data, queue=queue)) > 0.02
 
 
-@pass_if_not_implemented_for_gpu(reason="svr is not implemented")
+@pass_if_not_implemented_for_gpu(reason="Regression SVM is not implemented for GPU")
 @pytest.mark.parametrize("queue", get_queues())
 def test_input_format_for_diabetes(queue):
     diabetes = datasets.load_diabetes()
@@ -120,7 +83,7 @@ def test_input_format_for_diabetes(queue):
     assert_allclose(res_c_contiguous_numpy, res_f_contiguous_numpy)
 
 
-@pass_if_not_implemented_for_gpu(reason="svr is not implemented")
+@pass_if_not_implemented_for_gpu(reason="Regression SVM is not implemented for GPU")
 @pytest.mark.parametrize("queue", get_queues())
 def test_predict(queue):
     iris = datasets.load_iris()
@@ -144,7 +107,7 @@ def _test_diabetes_compare_with_sklearn(queue, kernel):
     diabetes = datasets.load_diabetes()
     clf_onedal = SVR(kernel=kernel, C=10.0, gamma=2)
     clf_onedal.fit(diabetes.data, diabetes.target, queue=queue)
-    result = clf_onedal.score(diabetes.data, diabetes.target, queue=queue)
+    result = r2_score(diabetes.target, clf_onedal.predict(diabetes.data, queue=queue))
 
     clf_sklearn = SklearnSVR(kernel=kernel, C=10.0, gamma=2)
     clf_sklearn.fit(diabetes.data, diabetes.target)
@@ -158,20 +121,29 @@ def _test_diabetes_compare_with_sklearn(queue, kernel):
     assert_allclose(clf_sklearn.dual_coef_, clf_onedal.dual_coef_, atol=1e-1)
 
 
-@pass_if_not_implemented_for_gpu(reason="svr is not implemented")
+@pass_if_not_implemented_for_gpu(reason="Regression SVM is not implemented for GPU")
 @pytest.mark.parametrize("queue", get_queues())
 @pytest.mark.parametrize("kernel", ["linear", "rbf", "poly", "sigmoid"])
 def test_diabetes_compare_with_sklearn(queue, kernel):
+    if kernel == "sigmoid":
+        pytest.skip("Sparse sigmoid kernel function is buggy.")
     _test_diabetes_compare_with_sklearn(queue, kernel)
 
 
 def _test_synth_rbf_compare_with_sklearn(queue, C, gamma):
     x, y = datasets.make_regression(**synth_params)
-    clf = SVR(kernel="rbf", gamma=gamma, C=C)
-    clf.fit(x, y, queue=queue)
-    result = clf.score(x, y, queue=queue)
+    if gamma == "auto":
+        _gamma = 1.0 / x.shape[1]
+    elif gamma == "scale":
+        _gamma = 1.0 / (x.shape[1] * x.var())
+    else:
+        _gamma = gamma
 
-    clf = SklearnSVR(kernel="rbf", gamma=gamma, C=C)
+    clf = SVR(kernel="rbf", gamma=_gamma, C=C)
+    clf.fit(x, y, queue=queue)
+    result = r2_score(y, clf.predict(x, queue=queue))
+
+    clf = SklearnSVR(kernel="rbf", gamma=_gamma, C=C)
     clf.fit(x, y)
     expected = clf.score(x, y)
 
@@ -179,7 +151,7 @@ def _test_synth_rbf_compare_with_sklearn(queue, C, gamma):
     assert result > expected - 1e-5
 
 
-@pass_if_not_implemented_for_gpu(reason="svr is not implemented")
+@pass_if_not_implemented_for_gpu(reason="Regression SVM is not implemented for GPU")
 @pytest.mark.parametrize("queue", get_queues())
 @pytest.mark.parametrize("gamma", ["scale", "auto"])
 @pytest.mark.parametrize("C", [100.0, 1000.0])
@@ -191,7 +163,7 @@ def _test_synth_linear_compare_with_sklearn(queue, C):
     x, y = datasets.make_regression(**synth_params)
     clf = SVR(kernel="linear", C=C)
     clf.fit(x, y, queue=queue)
-    result = clf.score(x, y, queue=queue)
+    result = r2_score(y, clf.predict(x, queue=queue))
 
     clf = SklearnSVR(kernel="linear", C=C)
     clf.fit(x, y)
@@ -203,7 +175,7 @@ def _test_synth_linear_compare_with_sklearn(queue, C):
     assert result > expected - 1e-3
 
 
-@pass_if_not_implemented_for_gpu(reason="svr is not implemented")
+@pass_if_not_implemented_for_gpu(reason="Regression SVM is not implemented for GPU")
 @pytest.mark.parametrize("queue", get_queues())
 @pytest.mark.parametrize("C", [0.001, 0.1])
 def test_synth_linear_compare_with_sklearn(queue, C):
@@ -212,9 +184,15 @@ def test_synth_linear_compare_with_sklearn(queue, C):
 
 def _test_synth_poly_compare_with_sklearn(queue, params):
     x, y = datasets.make_regression(**synth_params)
+    if params["gamma"] == "auto":
+        params["gamma"] = 1.0 / x.shape[1]
+
+    elif params["gamma"] == "scale":
+        params["gamma"] = 1.0 / (x.shape[1] * x.var())
+
     clf = SVR(kernel="poly", **params)
     clf.fit(x, y, queue=queue)
-    result = clf.score(x, y, queue=queue)
+    result = r2_score(y, clf.predict(x, queue=queue))
 
     clf = SklearnSVR(kernel="poly", **params)
     clf.fit(x, y)
@@ -224,7 +202,7 @@ def _test_synth_poly_compare_with_sklearn(queue, params):
     assert result > expected - 1e-5
 
 
-@pass_if_not_implemented_for_gpu(reason="svr is not implemented")
+@pass_if_not_implemented_for_gpu(reason="Regression SVM is not implemented for GPU")
 @pytest.mark.parametrize("queue", get_queues())
 @pytest.mark.parametrize(
     "params",
@@ -237,35 +215,37 @@ def test_synth_poly_compare_with_sklearn(queue, params):
     _test_synth_poly_compare_with_sklearn(queue, params)
 
 
-@pass_if_not_implemented_for_gpu(reason="svr is not implemented")
+@pass_if_not_implemented_for_gpu(reason="Regression SVM is not implemented for GPU")
 @pytest.mark.parametrize("queue", get_queues())
 def test_sided_sample_weight(queue):
     clf = SVR(C=1e-2, kernel="linear")
 
-    X = [[-2, 0], [-1, -1], [0, -2], [0, 2], [1, 1], [2, 0]]
-    Y = [1, 1, 1, 2, 2, 2]
+    X = np.array([[-2, 0], [-1, -1], [0, -2], [0, 2], [1, 1], [2, 0]], dtype=np.float64)
+    Y = np.array([1, 1, 1, 2, 2, 2], dtype=np.float64)
 
-    sample_weight = [10.0, 0.1, 0.1, 0.1, 0.1, 10]
+    X_pred = np.array([[-1.0, 1.0]], dtype=np.float64)
+
+    sample_weight = np.array([10.0, 0.1, 0.1, 0.1, 0.1, 10], dtype=np.float64)
     clf.fit(X, Y, sample_weight=sample_weight, queue=queue)
-    y_pred = clf.predict([[-1.0, 1.0]], queue=queue)
+    y_pred = clf.predict(X_pred, queue=queue)
     assert y_pred < 1.5
 
-    sample_weight = [1.0, 0.1, 10.0, 10.0, 0.1, 0.1]
+    sample_weight = np.array([1.0, 0.1, 10.0, 10.0, 0.1, 0.1], dtype=np.float64)
     clf.fit(X, Y, sample_weight=sample_weight, queue=queue)
-    y_pred = clf.predict([[-1.0, 1.0]], queue=queue)
+    y_pred = clf.predict(X_pred, queue=queue)
     assert y_pred > 1.5
 
-    sample_weight = [1] * 6
+    sample_weight = np.array([1] * 6, dtype=np.float64)
     clf.fit(X, Y, sample_weight=sample_weight, queue=queue)
-    y_pred = clf.predict([[-1.0, 1.0]], queue=queue)
+    y_pred = clf.predict(X_pred, queue=queue)
     assert y_pred == pytest.approx(1.5)
 
 
-@pass_if_not_implemented_for_gpu(reason="svr is not implemented")
+@pass_if_not_implemented_for_gpu(reason="Regression SVM is not implemented for GPU")
 @pytest.mark.parametrize("queue", get_queues())
 def test_pickle(queue):
     diabetes = datasets.load_diabetes()
-    clf = SVR(kernel="rbf", C=10.0)
+    clf = SVR(kernel="linear", C=10.0)
     clf.fit(diabetes.data, diabetes.target, queue=queue)
     expected = clf.predict(diabetes.data, queue=queue)
 

@@ -1,5 +1,5 @@
 # ==============================================================================
-# Copyright 2023 Intel Corporation
+# Copyright contributors to the oneDAL project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,62 +14,139 @@
 # limitations under the License.
 # ==============================================================================
 
-from onedal.neighbors import KNeighborsClassifier as KNeighborsClassifier_Batch
-from onedal.neighbors import KNeighborsRegressor as KNeighborsRegressor_Batch
+from ..._device_offload import supports_queue
+from ...common._backend import bind_spmd_backend
+from ...neighbors import KNeighborsClassifier as KNeighborsClassifier_Batch
+from ...neighbors import KNeighborsRegressor as KNeighborsRegressor_Batch
+from ...neighbors import NearestNeighbors as NearestNeighbors_Batch
 
-from ..._device_offload import support_usm_ndarray
-from .._base import BaseEstimatorSPMD
 
+class KNeighborsClassifier(KNeighborsClassifier_Batch):
 
-class KNeighborsClassifier(BaseEstimatorSPMD, KNeighborsClassifier_Batch):
-    @support_usm_ndarray()
+    @bind_spmd_backend("neighbors.classification")
+    def train(self, *args, **kwargs): ...
+
+    @bind_spmd_backend("neighbors.classification")
+    def infer(self, *args, **kwargs): ...
+
     def fit(self, X, y, queue=None):
+        # Store queue to use during inference if not provided (if X is none in kneighbors)
+        self.spmd_queue_ = queue
         return super().fit(X, y, queue=queue)
 
-    @support_usm_ndarray()
+    @supports_queue
     def predict(self, X, queue=None):
-        return super().predict(X, queue=queue)
+        # SPMD classification: call the SPMD backend's inference directly
+        from ...common._estimator_checks import _check_is_fitted
+        from ...datatypes import from_table, to_table
 
-    @support_usm_ndarray()
+        _check_is_fitted(self)
+
+        # Use the SPMD backend for classification prediction
+        params = super()._get_onedal_params(X)
+        if "responses" not in params["result_option"]:
+            params["result_option"] += "|responses"
+
+        # Call SPMD classification inference backend
+        X_table = to_table(
+            X, queue=queue if queue else getattr(self, "spmd_queue_", None)
+        )
+        params["fptype"] = X_table.dtype
+        result = self.infer(params, self._onedal_model, X_table)
+
+        responses = from_table(result.responses, like=X)
+        return responses[:, 0]
+
     def predict_proba(self, X, queue=None):
         raise NotImplementedError("predict_proba not supported in distributed mode.")
 
-    @support_usm_ndarray()
     def kneighbors(self, X=None, n_neighbors=None, return_distance=True, queue=None):
-        return super().kneighbors(X, n_neighbors, return_distance, queue=queue)
+        if queue is None:
+            queue = getattr(self, "spmd_queue_", None)
+        return super().kneighbors(
+            X, n_neighbors=n_neighbors, return_distance=return_distance, queue=queue
+        )
 
 
-class KNeighborsRegressor(BaseEstimatorSPMD, KNeighborsRegressor_Batch):
-    @support_usm_ndarray()
+class KNeighborsRegressor(KNeighborsRegressor_Batch):
+
+    @bind_spmd_backend("neighbors.search", lookup_name="train")
+    def train_search(self, *args, **kwargs): ...
+
+    @bind_spmd_backend("neighbors.search", lookup_name="infer")
+    def infer_search(self, *args, **kwargs): ...
+
+    @bind_spmd_backend("neighbors.regression")
+    def train(self, *args, **kwargs): ...
+
+    @bind_spmd_backend("neighbors.regression")
+    def infer(self, *args, **kwargs): ...
+
+    @supports_queue
     def fit(self, X, y, queue=None):
+        # Store queue to use during inference if not provided (if X is none in kneighbors)
+        self.spmd_queue_ = queue
         if queue is not None and queue.sycl_device.is_gpu:
-            return super()._fit(X, y, queue=queue)
+            return self._fit(X, y)
         else:
             raise ValueError(
                 "SPMD version of kNN is not implemented for "
                 "CPU. Consider running on it on GPU."
             )
 
-    @support_usm_ndarray()
     def kneighbors(self, X=None, n_neighbors=None, return_distance=True, queue=None):
-        return super().kneighbors(X, n_neighbors, return_distance, queue=queue)
+        if queue is None:
+            queue = getattr(self, "spmd_queue_", None)
+        return super().kneighbors(
+            X, n_neighbors=n_neighbors, return_distance=return_distance, queue=queue
+        )
 
-    @support_usm_ndarray()
+    @supports_queue
     def predict(self, X, queue=None):
-        return self._predict_gpu(X, queue=queue)
+        # SPMD regression: call the SPMD backend's inference directly
+        from ...common._estimator_checks import _check_is_fitted
+        from ...datatypes import from_table, to_table
 
-    def _get_onedal_params(self, X, y=None):
-        params = super()._get_onedal_params(X, y)
+        _check_is_fitted(self)
+
+        # Use the SPMD backend for regression prediction
+        params = super()._get_onedal_params(X)
+        if "responses" not in params["result_option"]:
+            params["result_option"] += "|responses"
+
+        # Call SPMD regression inference backend
+        X_table = to_table(
+            X, queue=queue if queue else getattr(self, "spmd_queue_", None)
+        )
+        params["fptype"] = X_table.dtype
+        result = self.infer(params, self._onedal_model, X_table)
+
+        responses = from_table(result.responses, like=X)
+        return responses[:, 0]
+
+    def _get_onedal_params(self, X, y=None, n_neighbors=None):
+        params = super()._get_onedal_params(X, y=y, n_neighbors=n_neighbors)
         if "responses" not in params["result_option"]:
             params["result_option"] += "|responses"
         return params
 
 
-class NearestNeighbors(BaseEstimatorSPMD):
-    @support_usm_ndarray()
-    def fit(self, X, y, queue=None):
+class NearestNeighbors(NearestNeighbors_Batch):
+
+    @bind_spmd_backend("neighbors.search")
+    def train(self, *args, **kwargs): ...
+
+    @bind_spmd_backend("neighbors.search")
+    def infer(self, *args, **kwargs): ...
+
+    def fit(self, X, y=None, queue=None):
+        # Store queue to use during inference if not provided (if X is none in kneighbors)
+        self.spmd_queue_ = queue
         return super().fit(X, y, queue=queue)
 
-    @support_usm_ndarray()
     def kneighbors(self, X=None, n_neighbors=None, return_distance=True, queue=None):
-        return super().kneighbors(X, n_neighbors, return_distance, queue=queue)
+        if queue is None:
+            queue = getattr(self, "spmd_queue_", None)
+        return super().kneighbors(
+            X, n_neighbors=n_neighbors, return_distance=return_distance, queue=queue
+        )

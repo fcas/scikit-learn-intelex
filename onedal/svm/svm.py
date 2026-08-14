@@ -14,60 +14,40 @@
 # limitations under the License.
 # ==============================================================================
 
-from abc import ABCMeta, abstractmethod
-from enum import Enum
-from numbers import Number, Real
+from abc import ABC, abstractmethod
+from math import sqrt
 
-import numpy as np
 from scipy import sparse as sp
-from sklearn.base import BaseEstimator
 
-from daal4py.sklearn._utils import sklearn_check_version
-from onedal import _backend
+from daal4py.sklearn._utils import is_sparse
 
+from .._device_offload import supports_queue
+from ..common._backend import bind_default_backend
 from ..common._estimator_checks import _check_is_fitted
-from ..common._mixin import ClassifierMixin, RegressorMixin
-from ..common._policy import _get_policy
 from ..datatypes import from_table, to_table
-from ..utils import (
-    _check_array,
-    _check_n_features,
-    _check_X_y,
-    _column_or_1d,
-    _validate_targets,
-)
+from ..utils.validation import _is_csr
+
+_csr_array = sp.csr_array if hasattr(sp, "csr_array") else sp.csr_matrix
 
 
-class SVMtype(Enum):
-    c_svc = 0
-    epsilon_svr = 1
-    nu_svc = 2
-    nu_svr = 3
+class BaseSVM(ABC):
 
-
-class BaseSVM(BaseEstimator, metaclass=ABCMeta):
-    @abstractmethod
     def __init__(
         self,
-        C,
+        C,  # Depending on the child class, C, nu, and/or epsilon are not used
         nu,
         epsilon,
         kernel="rbf",
         *,
-        degree,
-        gamma,
-        coef0,
-        tol,
-        shrinking,
-        cache_size,
-        max_iter,
-        tau,
-        class_weight,
-        decision_function_shape,
-        break_ties,
-        algorithm,
-        svm_type=None,
-        **kwargs,
+        degree=3,
+        gamma=None,
+        coef0=0.0,
+        tol=1e-3,
+        shrinking=True,
+        cache_size=200.0,
+        max_iter=-1,
+        tau=1e-12,
+        algorithm="thunder",
     ):
         self.C = C
         self.nu = nu
@@ -81,363 +61,131 @@ class BaseSVM(BaseEstimator, metaclass=ABCMeta):
         self.cache_size = cache_size
         self.max_iter = max_iter
         self.tau = tau
-        self.class_weight = class_weight
-        self.decision_function_shape = decision_function_shape
-        self.break_ties = break_ties
         self.algorithm = algorithm
-        self.svm_type = svm_type
+        self._onedal_model = None
 
-    def _compute_gamma_sigma(self, gamma, X):
-        if isinstance(gamma, str):
-            if gamma == "scale":
-                if sp.issparse(X):
-                    # var = E[X^2] - E[X]^2
-                    X_sc = (X.multiply(X)).mean() - (X.mean()) ** 2
-                else:
-                    X_sc = X.var()
-                _gamma = 1.0 / (X.shape[1] * X_sc) if X_sc != 0 else 1.0
-            elif gamma == "auto":
-                _gamma = 1.0 / X.shape[1]
-            else:
-                raise ValueError(
-                    "When 'gamma' is a string, it should be either 'scale' or "
-                    "'auto'. Got '{}' instead.".format(gamma)
-                )
-        else:
-            if sklearn_check_version("1.1") and not sklearn_check_version("1.2"):
-                if isinstance(gamma, Real):
-                    if gamma <= 0:
-                        msg = (
-                            f"gamma value must be > 0; {gamma!r} is invalid. Use"
-                            " a positive number or use 'auto' to set gamma to a"
-                            " value of 1 / n_features."
-                        )
-                        raise ValueError(msg)
-                    _gamma = gamma
-                else:
-                    msg = (
-                        "The gamma value should be set to 'scale', 'auto' or a"
-                        f" positive float value. {gamma!r} is not a valid option"
-                    )
-                    raise ValueError(msg)
-            else:
-                _gamma = gamma
-        return _gamma, np.sqrt(0.5 / _gamma)
+    @abstractmethod
+    def train(self, *args, **kwargs): ...
 
-    def _validate_targets(self, y, dtype):
-        self.class_weight_ = None
-        self.classes_ = None
-        return _column_or_1d(y, warn=True).astype(dtype, copy=False)
+    @abstractmethod
+    def infer(self, *args, **kwargs): ...
 
-    def _get_sample_weight(self, X, y, sample_weight):
-        n_samples = X.shape[0]
-        dtype = X.dtype
-        if n_samples == 1:
-            raise ValueError("n_samples=1")
-
-        sample_weight = np.asarray(
-            [] if sample_weight is None else sample_weight, dtype=np.float64
-        )
-
-        sample_weight_count = sample_weight.shape[0]
-        if sample_weight_count != 0 and sample_weight_count != n_samples:
-            raise ValueError(
-                "sample_weight and X have incompatible shapes: "
-                "%r vs %r\n"
-                "Note: Sparse matrices cannot be indexed w/"
-                "boolean masks (use `indices=True` in CV)."
-                % (len(sample_weight), X.shape)
-            )
-
-        ww = None
-        if sample_weight_count == 0 and self.class_weight_ is None:
-            return ww
-
-        if sample_weight_count == 0:
-            sample_weight = np.ones(n_samples, dtype=dtype)
-        elif isinstance(sample_weight, Number):
-            sample_weight = np.full(n_samples, sample_weight, dtype=dtype)
-        else:
-            sample_weight = _check_array(
-                sample_weight,
-                accept_sparse=False,
-                ensure_2d=False,
-                dtype=dtype,
-                order="C",
-            )
-            if sample_weight.ndim != 1:
-                raise ValueError("Sample weights must be 1D array or scalar")
-
-            if sample_weight.shape != (n_samples,):
-                raise ValueError(
-                    "sample_weight.shape == {}, expected {}!".format(
-                        sample_weight.shape, (n_samples,)
-                    )
-                )
-
-        if self.svm_type == SVMtype.nu_svc:
-            weight_per_class = [
-                np.sum(sample_weight[y == class_label]) for class_label in np.unique(y)
-            ]
-
-            for i in range(len(weight_per_class)):
-                for j in range(i + 1, len(weight_per_class)):
-                    if self.nu * (weight_per_class[i] + weight_per_class[j]) / 2 > min(
-                        weight_per_class[i], weight_per_class[j]
-                    ):
-                        raise ValueError("specified nu is infeasible")
-
-        if np.all(sample_weight <= 0):
-            if self.svm_type == SVMtype.nu_svc:
-                err_msg = "negative dimensions are not allowed"
-            else:
-                err_msg = "Invalid input - all samples have zero or negative weights."
-            raise ValueError(err_msg)
-        if np.any(sample_weight <= 0):
-            if self.svm_type == SVMtype.c_svc and len(
-                np.unique(y[sample_weight > 0])
-            ) != len(self.classes_):
-                raise ValueError(
-                    "Invalid input - all samples with positive weights "
-                    "belong to the same class"
-                    if sklearn_check_version("1.2")
-                    else "Invalid input - all samples with positive weights "
-                    "have the same label."
-                )
-        ww = sample_weight
-        if self.class_weight_ is not None:
-            for i, v in enumerate(self.class_weight_):
-                ww[y == i] *= v
-
-        if not ww.flags.c_contiguous and not ww.flags.f_contiguous:
-            ww = np.ascontiguousarray(ww, dtype)
-
-        return ww
-
-    def _get_onedal_params(self, data):
+    def _get_onedal_params(self, X):
         max_iter = 10000 if self.max_iter == -1 else self.max_iter
-        # TODO: remove this workaround
-        # when oneDAL SVM starts support of 'n_iterations' result
-        self.n_iter_ = 1 if max_iter < 1 else max_iter
-        class_count = 0 if self.classes_ is None else len(self.classes_)
+        # if gamma is not given as a value, use sklearn's "auto"
+        gamma = 1 / X.shape[1] if self.gamma is None else self.gamma
         return {
-            "fptype": "float" if data.dtype == np.float32 else "double",
-            "method": self.algorithm,
-            "kernel": self.kernel,
+            "fptype": X.dtype,
             "c": self.C,
             "nu": self.nu,
             "epsilon": self.epsilon,
-            "class_count": class_count,
-            "accuracy_threshold": self.tol,
-            "max_iteration_count": int(max_iter),
-            "scale": self._scale_,
-            "sigma": self._sigma_,
-            "shift": self.coef0,
+            "kernel": self.kernel,
             "degree": self.degree,
-            "tau": self.tau,
+            "shift": self.coef0 if self.kernel != "linear" else 0.0,
+            "scale": gamma if self.kernel != "linear" else 1.0,
+            "sigma": sqrt(0.5 / gamma) if self.kernel != "linear" else 1.0,
+            "accuracy_threshold": self.tol,
             "shrinking": self.shrinking,
             "cache_size": self.cache_size,
+            "max_iteration_count": int(max_iter),
+            "tau": self.tau,
+            "method": self.algorithm,
+            "class_count": self.class_count_,
         }
 
-    def _fit(self, X, y, sample_weight, module, queue):
-        if hasattr(self, "decision_function_shape"):
-            if self.decision_function_shape not in ("ovr", "ovo", None):
-                raise ValueError(
-                    f"decision_function_shape must be either 'ovr' or 'ovo', "
-                    f"got {self.decision_function_shape}."
-                )
+    @supports_queue
+    def fit(self, X, y, sample_weight=None, class_count=0, queue=None):
+        # oneDAL expects that the user has a priori knowledge of the y data
+        # and has placed them in a oneDAL-acceptable format, most important
+        # for this is the number of classes.
+        self.class_count_ = class_count
 
-        if y is None:
-            if self._get_tags()["requires_y"]:
-                raise ValueError(
-                    f"This {self.__class__.__name__} estimator "
-                    f"requires y to be passed, but the target y is None."
-                )
-        X, y = _check_X_y(
-            X,
-            y,
-            dtype=[np.float64, np.float32],
-            force_all_finite=True,
-            accept_sparse="csr",
-        )
-        y = self._validate_targets(y, X.dtype)
-        sample_weight = self._get_sample_weight(X, y, sample_weight)
+        data = (X, y) if sample_weight is None else (X, y, sample_weight)
 
-        self._sparse = sp.issparse(X)
+        self._sparse = is_sparse(X)
 
-        if self.kernel == "linear":
-            self._scale_, self._sigma_ = 1.0, 1.0
-            self.coef0 = 0.0
-        else:
-            self._scale_, self._sigma_ = self._compute_gamma_sigma(self.gamma, X)
-
-        policy = _get_policy(queue, X, y, sample_weight)
-        params = self._get_onedal_params(X)
-        result = module.train(policy, params, *to_table(X, y, sample_weight))
+        data_t = to_table(*data, queue=queue)
+        params = self._get_onedal_params(data_t[0])
+        result = self.train(params, *data_t)
 
         if self._sparse:
-            self.dual_coef_ = sp.csr_matrix(from_table(result.coeffs).T)
-            self.support_vectors_ = sp.csr_matrix(from_table(result.support_vectors))
+            self.dual_coef_ = _csr_array(from_table(result.coeffs).T)
+            self.support_vectors_ = _csr_array(from_table(result.support_vectors))
         else:
-            self.dual_coef_ = from_table(result.coeffs).T
-            self.support_vectors_ = from_table(result.support_vectors)
+            self.dual_coef_ = from_table(result.coeffs, like=X).T
+            self.support_vectors_ = from_table(result.support_vectors, like=X)
 
-        self.intercept_ = from_table(result.biases).ravel()
-        self.support_ = from_table(result.support_indices).ravel().astype("int")
-        self.n_features_in_ = X.shape[1]
-        self.shape_fit_ = X.shape
+        self.intercept_ = from_table(result.biases, like=X)
 
-        if getattr(self, "classes_", None) is not None:
-            indices = y.take(self.support_, axis=0)
-            self._n_support = np.array(
-                [np.sum(indices == i) for i, _ in enumerate(self.classes_)]
-            )
-        self._gamma = self._scale_
+        if len(self.intercept_.shape) > 1:
+            self.intercept_ = self.intercept_[:, 0]
+
+        self.support_ = from_table(result.support_indices, like=X)
+
+        if len(self.support_.shape) > 1:
+            self.support_ = self.support_[:, 0]
+
+        if hasattr(result, "iteration_counts") and result.iteration_counts.shape[0]:
+            self.n_iter_ = from_table(result.iteration_counts, like=X)
+        else:
+            max_iter = 10000 if self.max_iter == -1 else self.max_iter
+            self.n_iter_ = max(1, max_iter)
 
         self._onedal_model = result.model
         return self
 
-    def _create_model(self, module):
-        m = module.model()
+    def _create_model(self, support_vectors_, dual_coef_, intercept_):
+        m = self.model()
 
-        m.support_vectors = to_table(self.support_vectors_)
-        m.coeffs = to_table(self.dual_coef_.T)
-        m.biases = to_table(self.intercept_)
+        self.support_vectors_ = support_vectors_
+        self.dual_coef_ = dual_coef_
+        self.intercept_ = intercept_
+        self._sparse = is_sparse(support_vectors_)
+        self.class_count_ = dual_coef_.shape[0] + 1
 
-        if self.svm_type is SVMtype.c_svc or self.svm_type is SVMtype.nu_svc:
-            m.first_class_response, m.second_class_response = 0, 1
-        return m
-
-    def _predict(self, X, module, queue):
-        _check_is_fitted(self)
-        if self.break_ties and self.decision_function_shape == "ovo":
-            raise ValueError(
-                "break_ties must be False when " "decision_function_shape is 'ovo'"
-            )
-
-        if module in [_backend.svm.classification, _backend.svm.nu_classification]:
-            sv = self.support_vectors_
-            if not self._sparse and sv.size > 0 and self._n_support.sum() != sv.shape[0]:
-                raise ValueError(
-                    "The internal representation "
-                    f"of {self.__class__.__name__} was altered"
-                )
-
-        if (
-            self.break_ties
-            and self.decision_function_shape == "ovr"
-            and len(self.classes_) > 2
-        ):
-            y = np.argmax(self.decision_function(X), axis=1)
+        m.support_vectors = to_table(support_vectors_)
+        m.biases = to_table(intercept_)
+        if sp.issparse(dual_coef_):
+            m.coeffs = to_table(dual_coef_.T.tocsr())
         else:
-            X = _check_array(
-                X,
-                dtype=[np.float64, np.float32],
-                force_all_finite=True,
-                accept_sparse="csr",
-            )
-            _check_n_features(self, X, False)
+            m.coeffs = to_table(dual_coef_.T)
 
-            if self._sparse and not sp.isspmatrix(X):
-                X = sp.csr_matrix(X)
-            if self._sparse:
+        self._onedal_model = m
+
+    @supports_queue
+    def _infer(self, X, queue=None):
+        _check_is_fitted(self)
+
+        if self._sparse:
+            if not _is_csr(X):
+                X = _csr_array(X)
+            else:
                 X.sort_indices()
 
-            if sp.issparse(X) and not self._sparse and not callable(self.kernel):
-                raise ValueError(
-                    "cannot use sparse input in %r trained on dense data"
-                    % type(self).__name__
-                )
+        X = to_table(X, queue=queue)
 
-            policy = _get_policy(queue, X)
-            params = self._get_onedal_params(X)
+        if self._onedal_model is None:
+            self._create_model(self.support_vectors_, self.dual_coef_, self.intercept_)
 
-            if hasattr(self, "_onedal_model"):
-                model = self._onedal_model
-            else:
-                model = self._create_model(module)
-            result = module.infer(policy, params, model, to_table(X))
-            y = from_table(result.responses)
-        return y
-
-    def _ovr_decision_function(self, predictions, confidences, n_classes):
-        n_samples = predictions.shape[0]
-        votes = np.zeros((n_samples, n_classes))
-        sum_of_confidences = np.zeros((n_samples, n_classes))
-
-        k = 0
-        for i in range(n_classes):
-            for j in range(i + 1, n_classes):
-                sum_of_confidences[:, i] -= confidences[:, k]
-                sum_of_confidences[:, j] += confidences[:, k]
-                votes[predictions[:, k] == 0, i] += 1
-                votes[predictions[:, k] == 1, j] += 1
-                k += 1
-
-        transformed_confidences = sum_of_confidences / (
-            3 * (np.abs(sum_of_confidences) + 1)
-        )
-        return votes + transformed_confidences
-
-    def _decision_function(self, X, module, queue):
-        _check_is_fitted(self)
-        X = _check_array(
-            X, dtype=[np.float64, np.float32], force_all_finite=False, accept_sparse="csr"
-        )
-        _check_n_features(self, X, False)
-
-        if self._sparse and not sp.isspmatrix(X):
-            X = sp.csr_matrix(X)
-        if self._sparse:
-            X.sort_indices()
-
-        if sp.issparse(X) and not self._sparse and not callable(self.kernel):
-            raise ValueError(
-                "cannot use sparse input in %r trained on dense data"
-                % type(self).__name__
-            )
-
-        if module in [_backend.svm.classification, _backend.svm.nu_classification]:
-            sv = self.support_vectors_
-            if not self._sparse and sv.size > 0 and self._n_support.sum() != sv.shape[0]:
-                raise ValueError(
-                    "The internal representation "
-                    f"of {self.__class__.__name__} was altered"
-                )
-
-        policy = _get_policy(queue, X)
         params = self._get_onedal_params(X)
 
-        if hasattr(self, "_onedal_model"):
-            model = self._onedal_model
-        else:
-            model = self._create_model(module)
-        result = module.infer(policy, params, model, to_table(X))
-        decision_function = from_table(result.decision_function)
+        return self.infer(params, self._onedal_model, X)
 
-        if len(self.classes_) == 2:
-            decision_function = decision_function.ravel()
-
-        if self.decision_function_shape == "ovr" and len(self.classes_) > 2:
-            decision_function = self._ovr_decision_function(
-                decision_function < 0, -decision_function, len(self.classes_)
-            )
-        return decision_function
+    def predict(self, X, queue=None):
+        return from_table(self._infer(X, queue=queue).responses, like=X)[:, 0]
 
 
-class SVR(RegressorMixin, BaseSVM):
-    """
-    Epsilon--Support Vector Regression.
-    """
+class SVR(BaseSVM):
 
     def __init__(
         self,
         C=1.0,
+        nu=None,  # not used
         epsilon=0.1,
         kernel="rbf",
         *,
         degree=3,
-        gamma="scale",
+        gamma=None,
         coef0=0.0,
         tol=1e-3,
         shrinking=True,
@@ -445,11 +193,11 @@ class SVR(RegressorMixin, BaseSVM):
         max_iter=-1,
         tau=1e-12,
         algorithm="thunder",
-        **kwargs,
     ):
+
         super().__init__(
             C=C,
-            nu=0.5,
+            nu=nu,
             epsilon=epsilon,
             kernel=kernel,
             degree=degree,
@@ -460,49 +208,48 @@ class SVR(RegressorMixin, BaseSVM):
             cache_size=cache_size,
             max_iter=max_iter,
             tau=tau,
-            class_weight=None,
-            decision_function_shape=None,
-            break_ties=False,
             algorithm=algorithm,
         )
-        self.svm_type = SVMtype.epsilon_svr
 
-    def fit(self, X, y, sample_weight=None, queue=None):
-        return super()._fit(X, y, sample_weight, _backend.svm.regression, queue)
+    @bind_default_backend("svm.regression")
+    def train(self, *args, **kwargs): ...
 
-    def predict(self, X, queue=None):
-        y = super()._predict(X, _backend.svm.regression, queue)
-        return y.ravel()
+    @bind_default_backend("svm.regression")
+    def infer(self, *args, **kwargs): ...
+
+    @bind_default_backend("svm.regression")
+    def model(self): ...
+
+    def _get_onedal_params(self, X):
+        params = super()._get_onedal_params(X)
+        # The nu parameter is not set
+        params.pop("nu")
+        return params
 
 
-class SVC(ClassifierMixin, BaseSVM):
-    """
-    C-Support Vector Classification.
-    """
+class SVC(BaseSVM):
 
     def __init__(
         self,
         C=1.0,
+        nu=None,  # not used
+        epsilon=None,  # not used
         kernel="rbf",
         *,
         degree=3,
-        gamma="scale",
+        gamma=None,
         coef0=0.0,
         tol=1e-3,
         shrinking=True,
         cache_size=200.0,
         max_iter=-1,
         tau=1e-12,
-        class_weight=None,
-        decision_function_shape="ovr",
-        break_ties=False,
         algorithm="thunder",
-        **kwargs,
     ):
         super().__init__(
             C=C,
-            nu=0.5,
-            epsilon=0.0,
+            nu=nu,
+            epsilon=epsilon,
             kernel=kernel,
             degree=degree,
             gamma=gamma,
@@ -512,45 +259,45 @@ class SVC(ClassifierMixin, BaseSVM):
             cache_size=cache_size,
             max_iter=max_iter,
             tau=tau,
-            class_weight=class_weight,
-            decision_function_shape=decision_function_shape,
-            break_ties=break_ties,
             algorithm=algorithm,
         )
-        self.svm_type = SVMtype.c_svc
 
-    def _validate_targets(self, y, dtype):
-        y, self.class_weight_, self.classes_ = _validate_targets(
-            y, self.class_weight, dtype
-        )
-        return y
+    def _create_model(self, support_vectors_, dual_coef_, intercept_) -> None:
+        super()._create_model(support_vectors_, dual_coef_, intercept_)
+        self._onedal_model.first_class_response = 0
+        self._onedal_model.second_class_response = 1
 
-    def fit(self, X, y, sample_weight=None, queue=None):
-        return super()._fit(X, y, sample_weight, _backend.svm.classification, queue)
+    def _get_onedal_params(self, X):
+        params = super()._get_onedal_params(X)
+        # The nu and epsilon parameter are not used
+        params.pop("nu")
+        params.pop("epsilon")
+        return params
 
-    def predict(self, X, queue=None):
-        y = super()._predict(X, _backend.svm.classification, queue)
-        if len(self.classes_) == 2:
-            y = y.ravel()
-        return self.classes_.take(np.asarray(y, dtype=np.intp)).ravel()
+    @bind_default_backend("svm.classification")
+    def train(self, *args, **kwargs): ...
+
+    @bind_default_backend("svm.classification")
+    def infer(self, *args, **kwargs): ...
+
+    @bind_default_backend("svm.classification")
+    def model(self): ...
 
     def decision_function(self, X, queue=None):
-        return super()._decision_function(X, _backend.svm.classification, queue)
+        return from_table(self._infer(X, queue=queue).decision_function, like=X)
 
 
-class NuSVR(RegressorMixin, BaseSVM):
-    """
-    Nu-Support Vector Regression.
-    """
+class NuSVR(BaseSVM):
 
     def __init__(
         self,
         nu=0.5,
         C=1.0,
+        epsilon=None,  # not used
         kernel="rbf",
         *,
         degree=3,
-        gamma="scale",
+        gamma=None,
         coef0=0.0,
         tol=1e-3,
         shrinking=True,
@@ -558,12 +305,11 @@ class NuSVR(RegressorMixin, BaseSVM):
         max_iter=-1,
         tau=1e-12,
         algorithm="thunder",
-        **kwargs,
     ):
         super().__init__(
             C=C,
             nu=nu,
-            epsilon=0.0,
+            epsilon=epsilon,
             kernel=kernel,
             degree=degree,
             gamma=gamma,
@@ -573,49 +319,48 @@ class NuSVR(RegressorMixin, BaseSVM):
             cache_size=cache_size,
             max_iter=max_iter,
             tau=tau,
-            class_weight=None,
-            decision_function_shape=None,
-            break_ties=False,
             algorithm=algorithm,
         )
-        self.svm_type = SVMtype.nu_svr
 
-    def fit(self, X, y, sample_weight=None, queue=None):
-        return super()._fit(X, y, sample_weight, _backend.svm.nu_regression, queue)
+    def _get_onedal_params(self, X):
+        params = super()._get_onedal_params(X)
+        # The epsilon parameter is not used
+        params.pop("epsilon")
+        return params
 
-    def predict(self, X, queue=None):
-        y = super()._predict(X, _backend.svm.nu_regression, queue)
-        return y.ravel()
+    @bind_default_backend("svm.nu_regression")
+    def train(self, *args, **kwargs): ...
+
+    @bind_default_backend("svm.nu_regression")
+    def infer(self, *args, **kwargs): ...
+
+    @bind_default_backend("svm.nu_regression")
+    def model(self): ...
 
 
-class NuSVC(ClassifierMixin, BaseSVM):
-    """
-    Nu-Support Vector Classification.
-    """
+class NuSVC(BaseSVM):
 
     def __init__(
         self,
+        C=None,  # not used
         nu=0.5,
+        epsilon=None,  # not used
         kernel="rbf",
         *,
         degree=3,
-        gamma="scale",
+        gamma=None,
         coef0=0.0,
         tol=1e-3,
         shrinking=True,
         cache_size=200.0,
         max_iter=-1,
         tau=1e-12,
-        class_weight=None,
-        decision_function_shape="ovr",
-        break_ties=False,
         algorithm="thunder",
-        **kwargs,
     ):
         super().__init__(
-            C=1.0,
+            C=C,
             nu=nu,
-            epsilon=0.0,
+            epsilon=epsilon,
             kernel=kernel,
             degree=degree,
             gamma=gamma,
@@ -625,27 +370,29 @@ class NuSVC(ClassifierMixin, BaseSVM):
             cache_size=cache_size,
             max_iter=max_iter,
             tau=tau,
-            class_weight=class_weight,
-            decision_function_shape=decision_function_shape,
-            break_ties=break_ties,
             algorithm=algorithm,
         )
-        self.svm_type = SVMtype.nu_svc
 
-    def _validate_targets(self, y, dtype):
-        y, self.class_weight_, self.classes_ = _validate_targets(
-            y, self.class_weight, dtype
-        )
-        return y
+    def _create_model(self, support_vectors_, dual_coef_, intercept_) -> None:
+        super()._create_model(support_vectors_, dual_coef_, intercept_)
+        self._onedal_model.first_class_response = 0
+        self._onedal_model.second_class_response = 1
 
-    def fit(self, X, y, sample_weight=None, queue=None):
-        return super()._fit(X, y, sample_weight, _backend.svm.nu_classification, queue)
+    def _get_onedal_params(self, X):
+        params = super()._get_onedal_params(X)
+        # The C and epsilon parameters are not used
+        params.pop("c")
+        params.pop("epsilon")
+        return params
 
-    def predict(self, X, queue=None):
-        y = super()._predict(X, _backend.svm.nu_classification, queue)
-        if len(self.classes_) == 2:
-            y = y.ravel()
-        return self.classes_.take(np.asarray(y, dtype=np.intp)).ravel()
+    @bind_default_backend("svm.nu_classification")
+    def train(self, *args, **kwargs): ...
+
+    @bind_default_backend("svm.nu_classification")
+    def infer(self, *args, **kwargs): ...
+
+    @bind_default_backend("svm.nu_classification")
+    def model(self): ...
 
     def decision_function(self, X, queue=None):
-        return super()._decision_function(X, _backend.svm.nu_classification, queue)
+        return from_table(self._infer(X, queue=queue).decision_function, like=X)

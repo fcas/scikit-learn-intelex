@@ -39,6 +39,47 @@ def wrap_algo(algo, ver):
         for x in [
             "daal",
             "algorithms",
+            "algorithms::association_rules",
+            "algorithms::adaboost",
+            "algorithms::adaboost::prediction",
+            "algorithms::adaboost::training",
+            "algorithms::brownboost",
+            "algorithms::brownboost::prediction",
+            "algorithms::brownboost::training",
+            "algorithms::logitboost",
+            "algorithms::logitboost::prediction",
+            "algorithms::logitboost::training",
+            "algorithms::decision_tree",
+            "algorithms::decision_tree::classification",
+            "algorithms::decision_tree::classification::prediction",
+            "algorithms::decision_tree::classification::training",
+            "algorithms::decision_tree::regression",
+            "algorithms::decision_tree::regression::prediction",
+            "algorithms::decision_tree::regression::training",
+            "algorithms::distributions::bernoulli",
+            "algorithms::distributions::normal",
+            "algorithms::distributions::uniform",
+            "algorithms::multinomial_naive_bayes",
+            "algorithms::multinomial_naive_bayes::prediction",
+            "algorithms::multinomial_naive_bayes::training",
+            "algorithms::bacon_outlier_detection",
+            "algorithms::multivariate_outlier_detection",
+            "algorithms::univariate_outlier_detection",
+            "algorithms::optimization_solver::adagrad",
+            "algorithms::optimization_solver::saga",
+            "algorithms::optimization_solver::sgd",
+            "algorithms::quantiles",
+            "algorithms::sorting",
+            "algorithms::stump",
+            "algorithms::stump::classification",
+            "algorithms::stump::classification::prediction",
+            "algorithms::stump::classification::training",
+            "algorithms::stump::regression",
+            "algorithms::stump::regression::prediction",
+            "algorithms::stump::regression::training",
+            "algorithms::weak_learner",
+            "algorithms::weak_learner::prediction",
+            "algorithms::weak_learner::training",
             "algorithms::linear_model::prediction",
             "algorithms::linear_model::training",
             "algorithms::classification::prediction",
@@ -58,11 +99,10 @@ def wrap_algo(algo, ver):
 
 
 # Listing required parameters for each algorithm.
-# They are used to initialize the algorithm object instead of gettings set explicitly.
+# They are used to initialize the algorithm object instead of being set explicitly.
 # Note: even though listed under 'Batch', they are currently also used for 'Distributed'
 #  unless explicitly provided in a step spec.
 required = {
-    "algorithms::distributions::bernoulli": [("p", "double")],
     "algorithms::em_gmm": [("nComponents", "size_t")],
     "algorithms::em_gmm::init": [("nComponents", "size_t")],
     "algorithms::kmeans": [("nClusters", "size_t"), ("maxIterations", "size_t")],
@@ -106,6 +146,8 @@ no_constructor = {
     "algorithms::engines::mt19937::Batch": {"seed": ["size_t", "seed"]},
     "algorithms::engines::mt2203::Batch": {"seed": ["size_t", "seed"]},
     "algorithms::engines::mcg59::Batch": {"seed": ["size_t", "seed"]},
+    "algorithms::engines::mrg32k3a::Batch": {"seed": ["size_t", "seed"]},
+    "algorithms::engines::philox4x32x10::Batch": {"seed": ["size_t", "seed"]},
 }
 
 # Some algorithms require a setup function, to provide input without actual compute
@@ -291,7 +333,7 @@ ifaces = {
 # By default input arguments have no default value (e.g. they are required).
 # Here you can make input arguments and parameters optional by providing their
 # default value (for each algorithm).
-# Set True value for standart data types and shared pointers.
+# Set True value for standard data types and shared pointers.
 defaults = {
     "algorithms::pca": {"correlation": True},
     "algorithms::multivariate_outlier_detection": {
@@ -386,7 +428,7 @@ SSpec.__new__.__defaults__ = (None,) * (len(SSpec._fields) - 5) + (
 )
 
 # We list all algos with distributed versions here.
-# The indivdual dicts get passed to jinja as global vars (as-is).
+# The individual dicts get passed to jinja as global vars (as-is).
 # Each algorithm provides it distributed pattern and the configuration parameters.
 # The latter are provided per step.
 # Do we want to include the flow-spec in here?
@@ -883,6 +925,12 @@ no_warn = {
         "ParameterType",
     ],
     "algorithms::engines::mt2203": [
+        "ParameterType",
+    ],
+    "algorithms::engines::mrg32k3a": [
+        "ParameterType",
+    ],
+    "algorithms::engines::philox4x32x10": [
         "ParameterType",
     ],
     "algorithms::gbt": [

@@ -14,25 +14,14 @@
 # limitations under the License.
 # ==============================================================================
 
-from onedal.linear_model import LogisticRegression as LogisticRegression_Batch
-
-from ..._device_offload import support_usm_ndarray
-from .._base import BaseEstimatorSPMD
+from ...common._backend import bind_spmd_backend
+from ...linear_model import LogisticRegression as LogisticRegression_Batch
 
 
-class LogisticRegression(BaseEstimatorSPMD, LogisticRegression_Batch):
-    @support_usm_ndarray()
-    def fit(self, X, y, queue=None):
-        return super().fit(X, y, queue=queue)
+class LogisticRegression(LogisticRegression_Batch):
 
-    @support_usm_ndarray()
-    def predict(self, X, queue=None):
-        return super().predict(X, queue=queue)
+    @bind_spmd_backend("logistic_regression.classification")
+    def train(self, params, X, y): ...
 
-    @support_usm_ndarray()
-    def predict_proba(self, X, queue=None):
-        return super().predict_proba(X, queue=queue)
-
-    @support_usm_ndarray()
-    def predict_log_proba(self, X, queue=None):
-        return super().predict_log_proba(X, queue=queue)
+    @bind_spmd_backend("logistic_regression.classification")
+    def infer(self, params, X, model): ...

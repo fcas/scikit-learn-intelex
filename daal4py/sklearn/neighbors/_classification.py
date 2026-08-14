@@ -22,21 +22,15 @@ from sklearn.base import ClassifierMixin as BaseClassifierMixin
 from sklearn.neighbors._classification import (
     KNeighborsClassifier as BaseKNeighborsClassifier,
 )
-from sklearn.utils.validation import check_array
+from sklearn.utils.validation import _deprecate_positional_args, check_array
 
-from .._device_offload import support_usm_ndarray
-from .._utils import PatchingConditionsChain, getFPType, sklearn_check_version
+from .._utils import PatchingConditionsChain, getFPType
+from ..utils.validation import check_feature_names
 from ._base import KNeighborsMixin, NeighborsBase, parse_auto_method, prediction_algorithm
-
-if not sklearn_check_version("1.2"):
-    from sklearn.neighbors._base import _check_weights
-
-from sklearn.utils.validation import _deprecate_positional_args
 
 
 def daal4py_classifier_predict(estimator, X, base_predict):
-    if sklearn_check_version("1.0"):
-        estimator._check_feature_names(X, reset=False)
+    check_feature_names(estimator, X, reset=False)
     X = check_array(X, accept_sparse="csr", dtype=[np.float64, np.float32])
     daal_model = getattr(estimator, "_daal_model", None)
     n_features = getattr(estimator, "n_features_in_", None)
@@ -120,22 +114,16 @@ class KNeighborsClassifier(KNeighborsMixin, BaseClassifierMixin, NeighborsBase):
             n_jobs=n_jobs,
             **kwargs,
         )
-        self.weights = (
-            weights if sklearn_check_version("1.0") else _check_weights(weights)
-        )
+        self.weights = weights
 
-    @support_usm_ndarray()
     def fit(self, X, y):
         return NeighborsBase._fit(self, X, y)
 
-    @support_usm_ndarray()
     def predict(self, X):
         return daal4py_classifier_predict(self, X, BaseKNeighborsClassifier.predict)
 
-    @support_usm_ndarray()
     def predict_proba(self, X):
-        if sklearn_check_version("1.0"):
-            self._check_feature_names(X, reset=False)
+        check_feature_names(self, X, reset=False)
         return BaseKNeighborsClassifier.predict_proba(self, X)
 
     fit.__doc__ = BaseKNeighborsClassifier.fit.__doc__

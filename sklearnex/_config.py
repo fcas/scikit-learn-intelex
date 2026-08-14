@@ -14,88 +14,117 @@
 # limitations under the License.
 # ==============================================================================
 
-import threading
+import sys
 from contextlib import contextmanager
 
 from sklearn import get_config as skl_get_config
 from sklearn import set_config as skl_set_config
 
-_default_global_config = {
-    "target_offload": "auto",
-    "allow_fallback_to_host": False,
-}
+from daal4py.sklearn._utils import sklearn_check_version
+from onedal._config import _get_config as onedal_get_config
 
-_threadlocal = threading.local()
+__all__ = ["get_config", "set_config", "config_context"]
 
-
-def _get_sklearnex_threadlocal_config():
-    if not hasattr(_threadlocal, "global_config"):
-        _threadlocal.global_config = _default_global_config.copy()
-    return _threadlocal.global_config
+tab = "    " if (sys.version_info.major == 3 and sys.version_info.minor < 13) else ""
+_options_docstring = f"""Parameters
+{tab}----------
+{tab}target_offload : str or dpctl.SyclQueue or None
+{tab}    The device used to perform computations, either as a string indicating a name
+{tab}    recognized by the SYCL runtime, such as ``"gpu"``, ``"gpu:0"``, or as a
+{tab}    :obj:`dpctl.SyclQueue` object indicating where to move the data.
+{tab}
+{tab}    Assuming SYCL-related dependencies are installed, the list of devices recognized
+{tab}    by SYCL can be retrieved through the CLI tool ``sycl-ls`` in a shell, or through
+{tab}    :obj:`dpctl.get_devices` in a Python process.
+{tab}
+{tab}    String ``"auto"`` is also accepted.
+{tab}
+{tab}    Global default: ``"auto"``.
+{tab}
+{tab}allow_fallback_to_host : bool or None
+{tab}    If ``True``, allows computations to fall back to host device (CPU) when an unsupported
+{tab}    operation is attempted on GPU through ``target_offload``.
+{tab}
+{tab}    Global default: ``False``.
+{tab}
+{tab}allow_sklearn_after_onedal : bool or None, default=None
+{tab}    If ``True``, allows computations to fall back to stock scikit-learn when no
+{tab}    accelered version of the operation is available (see :ref:`algorithms`).
+{tab}
+{tab}    Global default: ``True``.
+{tab}
+{tab}sklearn_configs : kwargs
+{tab}    Other settings accepted by scikit-learn. See :obj:`sklearn.set_config` for
+{tab}    details.
+{tab}
+{tab}Note
+{tab}----
+{tab}Usage of ``target_offload`` requires additional dependencies - see
+{tab}:ref:`GPU support <oneapi_gpu>` for more information."""
 
 
 def get_config():
-    """Retrieve current values for configuration set by :func:`set_config`
+    """Retrieve current values for configuration set by :func:`set_config`.
+
     Returns
     -------
     config : dict
         Keys are parameter names that can be passed to :func:`set_config`.
+
     See Also
     --------
     config_context : Context manager for global configuration.
     set_config : Set global configuration.
     """
     sklearn = skl_get_config()
-    sklearnex = _get_sklearnex_threadlocal_config().copy()
+    sklearnex = onedal_get_config()
     return {**sklearn, **sklearnex}
 
 
-def set_config(target_offload=None, allow_fallback_to_host=None, **sklearn_configs):
-    """Set global configuration
-    Parameters
-    ----------
-    target_offload : string or dpctl.SyclQueue, default=None
-        The device primarily used to perform computations.
-        If string, expected to be "auto" (the execution context
-        is deduced from input data location),
-        or SYCL* filter selector string. Global default: "auto".
-    allow_fallback_to_host : bool, default=None
-        If True, allows to fallback computation to host device
-        in case particular estimator does not support the selected one.
-        Global default: False.
+def set_config(
+    target_offload=None,
+    allow_fallback_to_host=None,
+    allow_sklearn_after_onedal=None,
+    **sklearn_configs,
+):  # numpydoc ignore=PR01,PR07
+    """Set global configuration.
+
+    %_options_docstring%
+
     See Also
     --------
     config_context : Context manager for global configuration.
     get_config : Retrieve current values of the global configuration.
     """
+
     skl_set_config(**sklearn_configs)
 
-    local_config = _get_sklearnex_threadlocal_config()
+    local_config = onedal_get_config(copy=False)
 
     if target_offload is not None:
         local_config["target_offload"] = target_offload
     if allow_fallback_to_host is not None:
         local_config["allow_fallback_to_host"] = allow_fallback_to_host
+    if allow_sklearn_after_onedal is not None:
+        local_config["allow_sklearn_after_onedal"] = allow_sklearn_after_onedal
+
+
+set_config.__doc__ = set_config.__doc__.replace(
+    "%_options_docstring%", _options_docstring
+)
 
 
 @contextmanager
-def config_context(**new_config):
-    """Context manager for global scikit-learn configuration
-    Parameters
-    ----------
-    target_offload : string or dpctl.SyclQueue, default=None
-        The device primarily used to perform computations.
-        If string, expected to be "auto" (the execution context
-        is deduced from input data location),
-        or SYCL* filter selector string. Global default: "auto".
-    allow_fallback_to_host : bool, default=None
-        If True, allows to fallback computation to host device
-        in case particular estimator does not support the selected one.
-        Global default: False.
-    Notes
-    -----
+def config_context(**new_config):  # numpydoc ignore=PR01,PR07
+    """Context manager for local scikit-learn-intelex configurations.
+
+    %_options_docstring%
+
+    Note
+    ----
     All settings, not just those presently modified, will be returned to
     their previous values when the context manager is exited.
+
     See Also
     --------
     set_config : Set global scikit-learn configuration.
@@ -108,3 +137,8 @@ def config_context(**new_config):
         yield
     finally:
         set_config(**old_config)
+
+
+config_context.__doc__ = config_context.__doc__.replace(
+    "%_options_docstring%", _options_docstring
+)

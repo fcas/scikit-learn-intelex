@@ -14,244 +14,265 @@
 # limitations under the License.
 # ==============================================================================
 
-import logging
-import sys
-from collections.abc import Iterable
+import inspect
+from collections.abc import Callable
 from functools import wraps
+from typing import Any, Union
 
-import numpy as np
+from sklearn.utils import get_tags
+from sklearn.utils._array_api import get_namespace
 
-try:
-    from dpctl import SyclQueue
-    from dpctl.memory import MemoryUSMDevice, as_usm_memory
-    from dpctl.tensor import usm_ndarray
-
-    dpctl_available = True
-except ImportError:
-    dpctl_available = False
-
-try:
-    import dpnp
-
-    dpnp_available = True
-except ImportError:
-    dpnp_available = False
+from daal4py.sklearn._utils import sklearn_check_version
+from onedal._device_offload import _get_host_inputs, _transfer_to_host
+from onedal.utils import _sycl_queue_manager as QM
+from onedal.utils._array_api import _asarray, _is_numpy_namespace
 
 from ._config import get_config
-from ._utils import get_patch_message
-
-oneapi_is_available = "daal4py.oneapi" in sys.modules
-if oneapi_is_available:
-    from daal4py.oneapi import _get_device_name_sycl_ctxt, _get_sycl_ctxt_params
+from ._utils import PatchingConditionsChain
+from .base import oneDALEstimator
 
 
-class DummySyclQueue:
-    """This class is designed to act like dpctl.SyclQueue
-    to allow device dispatching in scenarios when dpctl is not available"""
-
-    class DummySyclDevice:
-        def __init__(self, filter_string):
-            self._filter_string = filter_string
-            self.is_cpu = "cpu" in filter_string
-            self.is_gpu = "gpu" in filter_string
-            # TODO: check for possibility of fp64 support
-            # on other devices in this dummy class
-            self.has_aspect_fp64 = self.is_cpu
-
-            if not (self.is_cpu):
-                logging.warning(
-                    "Device support is limited. "
-                    "Please install dpctl for full experience"
-                )
-
-        def get_filter_string(self):
-            return self._filter_string
-
-    def __init__(self, filter_string):
-        self.sycl_device = self.DummySyclDevice(filter_string)
-
-
-def _get_device_info_from_daal4py():
-    if oneapi_is_available:
-        return _get_device_name_sycl_ctxt(), _get_sycl_ctxt_params()
-    return None, dict()
-
-
-def _get_global_queue():
-    target = get_config()["target_offload"]
-    d4p_target, _ = _get_device_info_from_daal4py()
-    if d4p_target == "host":
-        d4p_target = "cpu"
-
-    QueueClass = DummySyclQueue if not dpctl_available else SyclQueue
-
-    if target != "auto":
-        if d4p_target is not None and d4p_target != target:
-            if not isinstance(target, str):
-                if d4p_target not in target.sycl_device.get_filter_string():
-                    raise RuntimeError(
-                        "Cannot use target offload option "
-                        "inside daal4py.oneapi.sycl_context"
-                    )
-            else:
-                raise RuntimeError(
-                    "Cannot use target offload option "
-                    "inside daal4py.oneapi.sycl_context"
-                )
-        if isinstance(target, QueueClass):
-            return target
-        return QueueClass(target)
-    if d4p_target is not None:
-        return QueueClass(d4p_target)
-    return None
-
-
-def _transfer_to_host(queue, *data):
-    has_usm_data, has_host_data = False, False
-
-    host_data = []
-    for item in data:
-        usm_iface = getattr(item, "__sycl_usm_array_interface__", None)
-        if usm_iface is not None:
-            if not dpctl_available:
-                raise RuntimeError(
-                    "dpctl need to be installed to work "
-                    "with __sycl_usm_array_interface__"
-                )
-            if queue is not None:
-                if queue.sycl_device != usm_iface["syclobj"].sycl_device:
-                    raise RuntimeError(
-                        "Input data shall be located " "on single target device"
-                    )
-            else:
-                queue = usm_iface["syclobj"]
-
-            buffer = as_usm_memory(item).copy_to_host()
-            order = "C"
-            if usm_iface["strides"] is not None:
-                if usm_iface["strides"][0] < usm_iface["strides"][1]:
-                    order = "F"
-            item = np.ndarray(
-                shape=usm_iface["shape"],
-                dtype=usm_iface["typestr"],
-                buffer=buffer,
-                order=order,
-            )
-            has_usm_data = True
-        else:
-            has_host_data = True
-
-        mismatch_host_item = usm_iface is None and item is not None and has_usm_data
-        mismatch_usm_item = usm_iface is not None and has_host_data
-
-        if mismatch_host_item or mismatch_usm_item:
-            raise RuntimeError("Input data shall be located on single target device")
-
-        host_data.append(item)
-    return queue, host_data
-
-
-def _get_backend(obj, queue, method_name, *data):
-    cpu_device = queue is None or queue.sycl_device.is_cpu
-    gpu_device = queue is not None and queue.sycl_device.is_gpu
+def _get_backend(
+    obj: type[oneDALEstimator], method_name: str, *data
+) -> tuple[Union[bool, None], PatchingConditionsChain]:
+    """This function verifies the hardware conditions, data characteristics, and
+    estimator parameters necessary for offloading computation to oneDAL. The status
+    of this patching is returned as a PatchingConditionsChain object along with a
+    boolean flag signaling whether the computation can be offloaded to oneDAL or not.
+    It is assumed that the queue (which determined what hardware to possibly use for
+    oneDAL) has been previously and extensively collected (i.e. the data has already
+    been checked using onedal's SyclQueueManager for queues)."""
+    queue = QM.get_global_queue()
+    cpu_device = queue is None or getattr(queue.sycl_device, "is_cpu", True)
+    gpu_device = queue is not None and getattr(queue.sycl_device, "is_gpu", False)
 
     if cpu_device:
         patching_status = obj._onedal_cpu_supported(method_name, *data)
-        if patching_status.get_status():
-            return "onedal", queue, patching_status
-        else:
-            return "sklearn", None, patching_status
-
-    _, d4p_options = _get_device_info_from_daal4py()
-    allow_fallback_to_host = get_config()["allow_fallback_to_host"] or d4p_options.get(
-        "host_offload_on_fail", False
-    )
+        return patching_status.get_status(), patching_status
 
     if gpu_device:
         patching_status = obj._onedal_gpu_supported(method_name, *data)
-        if patching_status.get_status():
-            return "onedal", queue, patching_status
-        else:
-            if allow_fallback_to_host:
-                patching_status = obj._onedal_cpu_supported(method_name, *data)
-                if patching_status.get_status():
-                    return "onedal", None, patching_status
-                else:
-                    return "sklearn", None, patching_status
-            else:
-                return "sklearn", None, patching_status
+        if not patching_status.get_status() and get_config()["allow_fallback_to_host"]:
+            QM.fallback_to_host()
+            return None, patching_status
+        return patching_status.get_status(), patching_status
 
-    raise RuntimeError("Device support is not implemented")
+    if get_config()["allow_fallback_to_host"]:
+        # This may trigger if the ``onedal.utils._sycl_queue_manager.__globals.non_queue``
+        # object is the queue (e.g. if non-SYCL device data is encountered)
+        QM.fallback_to_host()
+        return None, None
+    raise RuntimeError("Device support is not implemented for the supplied data type.")
 
 
-def dispatch(obj, method_name, branches, *args, **kwargs):
-    q = _get_global_queue()
-    q, hostargs = _transfer_to_host(q, *args)
-    q, hostvalues = _transfer_to_host(q, *kwargs.values())
-    hostkwargs = dict(zip(kwargs.keys(), hostvalues))
+if "array_api_dispatch" in get_config():
+    _array_api_offload = lambda: get_config()["array_api_dispatch"]
+else:
+    _array_api_offload = lambda: False
 
-    backend, q, patching_status = _get_backend(obj, q, method_name, *hostargs)
 
-    if backend == "onedal":
-        patching_status.write_log(queue=q)
-        return branches[backend](obj, *hostargs, **hostkwargs, queue=q)
-    if backend == "sklearn":
-        patching_status.write_log()
-        return branches[backend](obj, *hostargs, **hostkwargs)
-    raise RuntimeError(
-        f"Undefined backend {backend} in " f"{obj.__class__.__name__}.{method_name}"
+def dispatch(
+    obj: type[oneDALEstimator],
+    method_name: str,
+    branches: dict[Callable, Callable],
+    *args,
+    **kwargs,
+) -> Any:
+    """Dispatch object method call to oneDAL if conditionally possible.
+
+    Depending on support conditions, oneDAL will be called, otherwise it will
+    fall back to calling scikit-learn.  Dispatching to oneDAL can be influenced
+    by the 'allow_fallback_to_host' config parameter.
+
+    Parameters
+    ----------
+    obj : object
+        Sklearnex object which inherits from oneDALEstimator and contains
+        ``onedal_cpu_supported`` and ``onedal_gpu_supported`` methods which
+        evaluate oneDAL support.
+
+    method_name : str
+        Name of method to be evaluated for oneDAL support.
+
+    branches : dict
+        Dictionary containing functions to be called. Only keys 'sklearn' and
+        'onedal' are used which should contain the relevant scikit-learn and
+        onedal object methods respectively. All functions should accept the
+        inputs from *args and **kwargs. Additionally, the onedal object method
+        must accept a 'queue' keyword.
+
+    *args : tuple
+        Arguments to be supplied to the dispatched method.
+
+    **kwargs : dict
+        Keyword arguments to be supplied to the dispatched method.
+
+    Returns
+    -------
+    unknown : object
+        Returned object dependent on the supplied branches. Implicitly the returned
+        object types should match for the sklearn and onedal object methods.
+    """
+
+    # Determine if array_api dispatching is enabled, and if estimator is capable
+    onedal_array_api = _array_api_offload() and get_tags(obj).onedal_array_api
+    sklearn_array_api = _array_api_offload() and get_tags(obj).array_api_support
+
+    # backend can only be a boolean or None, None signifies an unverified backend
+    backend: "bool | None" = None
+
+    # The _sycl_queue_manager verifies all arguments are on a single SYCL device or
+    # cpu and will otherwise throw an error. If located on a non-SYCL, non-CPU
+    # device, a special queue is set which will cause a failure in ``_get_backend``
+    # Comment 2026-04-27: as of scikit-learn1.9, the behavior described above should
+    # no longer apply - instead, data should be moved to the namespace and device
+    # of either 'X' (in estimators) or 'y' (in metrics) if it wasn't originally there.
+    # But note that this requires doing the movements manually in every estimator.
+    # It should not move things right here, because up to this point, 'y' is whatever
+    # the user supplied, which can be strings for classifiers for example, which cannot
+    # be moved to a GPU device.
+    context = (
+        QM.manage_global_queue(None, *args)
+        if not _array_api_offload() or not sklearn_check_version("1.9")
+        else QM.manage_global_queue(None, *(args[:1]))
     )
+    with context:
+        if onedal_array_api:
+            backend, patching_status = _get_backend(obj, method_name, *args)
+            if backend:
+                queue = QM.get_global_queue()
+                patching_status.write_log(queue=queue, transferred_to_host=False)
+                return branches["onedal"](obj, *args, **kwargs, queue=queue)
+            elif sklearn_array_api and backend is False:
+                patching_status.write_log(transferred_to_host=False)
+                return branches["sklearn"](obj, *args, **kwargs)
 
+        # move data to host because of multiple reasons: array_api fallback to host
+        # and non array_api supporting oneDAL code
+        _, hostargs = _transfer_to_host(*args)
+        _, hostvalues = _transfer_to_host(*kwargs.values())
 
-def _copy_to_usm(queue, array):
-    if not dpctl_available:
-        raise RuntimeError(
-            "dpctl need to be installed to work " "with __sycl_usm_array_interface__"
-        )
+        hostkwargs = dict(zip(kwargs.keys(), hostvalues))
 
-    if hasattr(array, "__array__"):
+        while backend is None:
+            backend, patching_status = _get_backend(obj, method_name, *hostargs)
 
-        try:
-            mem = MemoryUSMDevice(array.nbytes, queue=queue)
-            mem.copy_from_host(array.tobytes())
-            return usm_ndarray(array.shape, array.dtype, buffer=mem)
-        except ValueError as e:
-            # ValueError will raise if device does not support the dtype
-            # retry with float32 (needed for fp16 and fp64 support issues)
-            # try again as float32, if it is a float32 just raise the error.
-            if array.dtype == np.float32:
-                raise e
-            return _copy_to_usm(queue, array.astype(np.float32))
-    else:
-        if isinstance(array, Iterable):
-            array = [_copy_to_usm(queue, i) for i in array]
-        return array
-
-
-if dpnp_available:
-
-    def _convert_to_dpnp(array):
-        if isinstance(array, usm_ndarray):
-            return dpnp.array(array, copy=False)
-        elif isinstance(array, Iterable):
-            for i in range(len(array)):
-                array[i] = _convert_to_dpnp(array[i])
-        return array
-
-
-def wrap_output_data(func):
-    @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        data = (*args, *kwargs.values())
-        if len(data) == 0:
-            usm_iface = None
+        if backend:
+            queue = QM.get_global_queue()
+            patching_status.write_log(queue=queue, transferred_to_host=False)
+            return branches["onedal"](obj, *hostargs, **hostkwargs, queue=queue)
         else:
-            usm_iface = getattr(data[0], "__sycl_usm_array_interface__", None)
+            if sklearn_array_api:
+                patching_status.write_log(transferred_to_host=False)
+                return branches["sklearn"](obj, *args, **kwargs)
+            else:
+                patching_status.write_log()
+                return branches["sklearn"](obj, *hostargs, **hostkwargs)
+
+
+def wrap_output_data(func: Callable) -> Callable:
+    """Transform function output to match input format.
+
+    Converts and moves the output arrays of the decorated function
+    to match the input array type and device.
+
+    Parameters
+    ----------
+    func : callable
+       Function or method which has array data as input.
+
+    Returns
+    -------
+    wrapper : callable
+        Wrapped function or method which will return matching format.
+    """
+
+    @wraps(func)
+    def wrapper(self, *args, **kwargs) -> Any:
         result = func(self, *args, **kwargs)
-        if usm_iface is not None:
-            result = _copy_to_usm(usm_iface["syclobj"], result)
-            if dpnp_available and isinstance(data[0], dpnp.ndarray):
-                result = _convert_to_dpnp(result)
+
+        # When transform_output is polars/pandas, sklearn's _set_output wrapper
+        # builds a DataFrame from the result. For array-api results whose data
+        # lives on a non-CPU device the DataFrame constructor raises: pandas with
+        # "Implicit conversion to a NumPy array is not allowed" and polars with
+        # "DataFrame constructor called with unsupported type". Transfer to host
+        # first so sklearn can wrap into the requested format.
+        if func.__name__ in ("transform", "fit_transform") and (
+            get_config().get("transform_output", "default") not in ("default", None)
+            or getattr(self, "_sklearn_output_config", {}).get("transform", "default")
+            != "default"
+        ):
+            _, (result,) = _transfer_to_host(result)
+            return result
+
+        # Array API path: result is already in the caller's namespace/device.
+        if _array_api_offload() and get_tags(self).onedal_array_api:
+            return result
+
+        if not args and not kwargs:
+            return result
+
+        data = (*args, *kwargs.values())[0]
+
+        if hasattr(data, "dtype"):
+            xp, is_array_api = get_namespace(data)
+            if is_array_api and not _is_numpy_namespace(xp):
+                device = getattr(data, "device", None)
+                if isinstance(result, tuple):
+                    result = tuple(xp.asarray(r, device=device) for r in result)
+                elif getattr(result, "ndim", 0) > 0:
+                    result = xp.asarray(result, device=device)
         return result
 
     return wrapper
+
+
+def support_input_format(func):
+    """Transform input and output function arrays to/from host.
+
+    Wraps host-side scikit-learn / daal4py fallback functions (device offload to
+    oneDAL happens in ``dispatch``): inputs are transferred to host and the output
+    is converted back to the input's array API namespace and device.
+
+    Parameters
+    ----------
+    func : callable
+       Function or method which has array data as input.
+
+    Returns
+    -------
+    wrapper_impl : callable
+        Wrapped function or method which will return matching format.
+    """
+
+    def invoke_func(self_or_None, *args, **kwargs):
+        if self_or_None is None:
+            return func(*args, **kwargs)
+        else:
+            return func(self_or_None, *args, **kwargs)
+
+    @wraps(func)
+    def wrapper_impl(*args, **kwargs):
+        # remove self from args if it is a class method
+        if inspect.isfunction(func) and "." in func.__qualname__:
+            self = args[0]
+            args = args[1:]
+        else:
+            self = None
+
+        if len(args) == 0 and len(kwargs) == 0:
+            return invoke_func(self, *args, **kwargs)
+
+        with QM.manage_global_queue(None, *args):
+            hostargs, hostkwargs = _get_host_inputs(*args, **kwargs)
+            result = invoke_func(self, *hostargs, **hostkwargs)
+
+        data = (*args, *kwargs.values())[0]
+        if get_config().get("transform_output") in ("default", None):
+            input_array_api = getattr(data, "__array_namespace__", lambda: None)()
+            if input_array_api and not _is_numpy_namespace(input_array_api):
+                input_array_api_device = data.device
+                result = _asarray(result, input_array_api, device=input_array_api_device)
+        return result
+
+    return wrapper_impl

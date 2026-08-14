@@ -19,12 +19,15 @@ import logging
 
 import pytest
 
-from sklearnex import patch_sklearn, unpatch_sklearn
+from sklearnex import config_context, patch_sklearn, unpatch_sklearn
 
 
 def pytest_configure(config):
     config.addinivalue_line(
         "markers", "allow_sklearn_fallback: mark test to not check for sklearnex usage"
+    )
+    config.addinivalue_line(
+        "markers", "mpi: mark test to require MPI for distributed testing"
     )
 
 
@@ -61,3 +64,15 @@ def with_sklearnex():
     patch_sklearn()
     yield
     unpatch_sklearn()
+
+
+@pytest.fixture
+def with_array_api():
+    with config_context(array_api_dispatch=True):
+        yield
+
+
+@pytest.fixture
+def without_allow_sklearn_after_onedal():
+    with config_context(allow_sklearn_after_onedal=False):
+        yield

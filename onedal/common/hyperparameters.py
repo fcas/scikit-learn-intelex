@@ -15,12 +15,16 @@
 # ==============================================================================
 
 import logging
+from typing import Callable, Dict, Tuple
 from warnings import warn
 
-from daal4py.sklearn._utils import daal_check_version
-from onedal import _backend
+from .. import _default_backend as backend
+from .. import onedal_check_version
 
-if daal_check_version((2024, "P", 0)):
+if not onedal_check_version(2024, 0, 0):
+    warn("Hyperparameters are supported in oneDAL starting from 2024.0.0 version.")
+    hyperparameters_map = {}
+else:
     _hparams_reserved_words = [
         "algorithm",
         "op",
@@ -56,9 +60,16 @@ if daal_check_version((2024, "P", 0)):
                 return super().__getattribute__(__name)
             elif __name in self.getters.keys():
                 return self.getters[__name]()
-            else:
-                raise ValueError(
-                    f"Unknown '{__name}' name in "
+            try:
+                # try to return attribute from base class
+                # required to read builtin attributes like __class__, __doc__, etc.
+                # which are used in debuggers
+                return super().__getattribute__(__name)
+            except AttributeError:
+                # raise an AttributeError with a hyperparameter-specific message
+                # for easier debugging
+                raise AttributeError(
+                    f"Unknown attribute '{__name}' in "
                     f"'{self.algorithm}.{self.op}' hyperparameters"
                 )
 
@@ -70,7 +81,7 @@ if daal_check_version((2024, "P", 0)):
                 self.setters[__name](__value)
             else:
                 raise ValueError(
-                    f"Unknown '{__name}' name in "
+                    f"Unknown attribute '{__name}' in "
                     f"'{self.algorithm}.{self.op}' hyperparameters"
                 )
 
@@ -83,16 +94,26 @@ if daal_check_version((2024, "P", 0)):
             for method in filter(lambda f: f.startswith(prefix), dir(obj))
         }
 
-    hyperparameters_backend = {
+    hyperparameters_backend: Dict[Tuple[str, str], Callable] = {
         (
             "linear_regression",
             "train",
-        ): _backend.linear_model.regression.train_hyperparameters(),
-        ("covariance", "compute"): _backend.covariance.compute_hyperparameters(),
+        ): lambda: backend.linear_model.regression.train_hyperparameters(),
+        ("covariance", "compute"): lambda: backend.covariance.compute_hyperparameters(),
     }
-    hyperparameters_map = {}
+    if onedal_check_version(2024, 3, 0):
+        hyperparameters_backend[("decision_forest", "infer")] = (
+            lambda: backend.decision_forest.infer_hyperparameters()
+        )
+    if onedal_check_version(2025, 7, 0):
+        hyperparameters_backend[("pca", "train")] = (
+            lambda: backend.decomposition.dim_reduction.train_hyperparameters()
+        )
 
-    for (algorithm, op), hyperparameters in hyperparameters_backend.items():
+    hyperparameters_map: Dict[Tuple[str, str], HyperParameters] = {}
+
+    for (algorithm, op), hyperparameters_lambda in hyperparameters_backend.items():
+        hyperparameters = hyperparameters_lambda()
         setters = get_methods_with_prefix(hyperparameters, "set_")
         getters = get_methods_with_prefix(hyperparameters, "get_")
 
@@ -106,11 +127,22 @@ if daal_check_version((2024, "P", 0)):
             algorithm, op, setters, getters, hyperparameters
         )
 
-    def get_hyperparameters(algorithm, op):
-        return hyperparameters_map[(algorithm, op)]
+    def get_hyperparameters_backend(algorithm, op):
+        """Get hyperparameters for a specific algorithm and operation."""
+        if (algorithm, op) in hyperparameters_backend:
+            return hyperparameters_backend[(algorithm, op)]()
+        else:
+            raise ValueError(f"Hyperparameters for '{algorithm}.{op}' are not defined.")
 
-else:
 
-    def get_hyperparameters(algorithm, op):
-        warn("Hyperparameters are supported in oneDAL starting from 2024.0.0 version.")
-        return None
+def get_hyperparameters(algorithm: str, op: str) -> HyperParameters:
+    return hyperparameters_map.get((algorithm, op), None)
+
+
+def reset_hyperparameters(algorithm: str, op: str) -> None:
+    new_hyperparameters_backend = get_hyperparameters_backend(algorithm, op)
+    new_setters = get_methods_with_prefix(new_hyperparameters_backend, "set_")
+    new_getters = get_methods_with_prefix(new_hyperparameters_backend, "get_")
+    hyperparameters_map[(algorithm, op)] = HyperParameters(
+        algorithm, op, new_setters, new_getters, new_hyperparameters_backend
+    )

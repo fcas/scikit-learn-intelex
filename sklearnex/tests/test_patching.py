@@ -16,51 +16,59 @@
 
 
 import importlib
-import inspect
 import logging
 import os
+import pickle
 import re
 import sys
+from functools import partial
 from inspect import signature
 
 import numpy as np
 import numpy.random as nprnd
 import pytest
-from sklearn.base import BaseEstimator
+from scipy import sparse as sp
+from sklearn import get_config as sklearn_get_config
+from sklearn.base import BaseEstimator, is_clusterer, is_regressor
+from sklearn.svm._base import BaseLibSVM
+from sklearn.utils import get_tags
+from sklearn.utils._array_api import get_namespace
 
-from daal4py.sklearn._utils import sklearn_check_version
+from daal4py.sklearn._utils import (
+    _package_check_version,
+    is_sparse,
+    sklearn_check_version,
+)
 from onedal.tests.utils._dataframes_support import (
+    _as_numpy,
     _convert_to_dataframe,
     get_dataframes_and_queues,
 )
-from sklearnex import is_patched_instance
+from sklearnex import config_context, is_patched_instance
 from sklearnex.dispatcher import _is_preview_enabled
 from sklearnex.metrics import pairwise_distances, roc_auc_score
-from sklearnex.tests._utils import (
+from sklearnex.tests.utils import (
     DTYPES,
     PATCHED_FUNCTIONS,
     PATCHED_MODELS,
     SPECIAL_INSTANCES,
     UNPATCHED_FUNCTIONS,
     UNPATCHED_MODELS,
+    call_method,
+    check_is_dynamic_method,
     gen_dataset,
     gen_models_info,
 )
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("dataframe, queue", get_dataframes_and_queues())
+@pytest.mark.parametrize(
+    "dataframe, queue", get_dataframes_and_queues("numpy,pandas", "cpu")
+)
 @pytest.mark.parametrize("metric", ["cosine", "correlation"])
 def test_pairwise_distances_patching(caplog, dataframe, queue, dtype, metric):
     with caplog.at_level(logging.WARNING, logger="sklearnex"):
-        if dtype == np.float16 and queue and not queue.sycl_device.has_aspect_fp16:
-            pytest.skip("Hardware does not support fp16 SYCL testing")
-        elif dtype == np.float64 and queue and not queue.sycl_device.has_aspect_fp64:
-            pytest.skip("Hardware does not support fp64 SYCL testing")
-        elif queue and queue.sycl_device.is_gpu:
-            pytest.skip("pairwise_distances does not support GPU queues")
-
-        rng = nprnd.default_rng()
+        rng = nprnd.default_rng(seed=123)
         if dataframe == "pandas":
             X = _convert_to_dataframe(
                 rng.random(size=1000).astype(dtype).reshape(1, -1),
@@ -84,15 +92,15 @@ def test_pairwise_distances_patching(caplog, dataframe, queue, dtype, metric):
 @pytest.mark.parametrize(
     "dtype", [i for i in DTYPES if "32" in i.__name__ or "64" in i.__name__]
 )
-@pytest.mark.parametrize("dataframe, queue", get_dataframes_and_queues())
+@pytest.mark.parametrize(
+    "dataframe, queue", get_dataframes_and_queues("numpy,pandas", "cpu")
+)
 def test_roc_auc_score_patching(caplog, dataframe, queue, dtype):
     if dtype in [np.uint32, np.uint64] and sys.platform == "win32":
         pytest.skip("Windows issue with unsigned ints")
-    elif dtype == np.float64 and queue and not queue.sycl_device.has_aspect_fp64:
-        pytest.skip("Hardware does not support fp64 SYCL testing")
 
     with caplog.at_level(logging.WARNING, logger="sklearnex"):
-        rng = nprnd.default_rng()
+        rng = nprnd.default_rng(seed=123)
         X = rng.integers(2, size=1000)
         y = rng.integers(2, size=1000)
 
@@ -119,102 +127,539 @@ def test_roc_auc_score_patching(caplog, dataframe, queue, dtype):
     ), f"sklearnex patching issue in roc_auc_score with log: \n{caplog.text}"
 
 
+# (estimator, method) pairs whose special-instance config is not array API viable in
+# stock sklearn itself: they raise a TypeError under array_api_dispatch, so the failure
+# is a sklearn conformance gap rather than a sklearnex regression and is tolerated in
+# test_special_estimator_patching_array_api. Any other failure there is treated as real.
+_SKLEARN_ARRAY_API_GAPS = {
+    ("SVC", "predict_log_proba"),
+    ("NuSVC", "predict_log_proba"),
+    ("DummyRegressor", "predict"),
+    ("DummyRegressor", "score"),
+    ("LocalOutlierFactor", "predict"),
+}
+
+
+def _check_estimator_patching(caplog, dataframe, queue, dtype, est, method):
+    # This should be modified as more array_api frameworks are tested and for
+    # upcoming changes in dpnp
+
+    result = None
+    with caplog.at_level(logging.WARNING, logger="sklearnex"):
+        from sklearn.datasets import load_breast_cancer
+
+        if est.__class__.__name__ in ["LogisticRegression", "LogisticRegressionCV"]:
+            # For LogisticRegression only binary classification is supported
+            binary_dataset_dict = {
+                "classification": [partial(load_breast_cancer, return_X_y=True)]
+            }
+            X, y = gen_dataset(
+                est,
+                queue=queue,
+                target_df=dataframe,
+                dtype=dtype,
+                datasets=binary_dataset_dict,
+            )[0]
+        else:
+            X, y = gen_dataset(est, queue=queue, target_df=dataframe, dtype=dtype)[0]
+
+        est.fit(X, y)
+        if method:
+            if not hasattr(est, method) and check_is_dynamic_method(est, method):
+                pytest.skip(f"sklearn available_if prevents testing {est}.{method}")
+            result = call_method(est, method, X, y)
+
+    assert all(
+        [
+            "running accelerated version" in i.message
+            or "fallback to original Scikit-learn" in i.message
+            for i in caplog.records
+        ]
+    ), f"sklearnex patching issue in {est}.{method} with log: \n{caplog.text}"
+
+    return result, X, y
+
+
+def _check_output_type(result, y, method, estimator_name, caplog, X, est=None):
+    """Check output type, device, and dtype conformance.
+
+    Checks for each result element:
+      1. Sparse: check class -> skip
+      2. Type: assert isinstance(res, input_type_y)
+      3. Device: assert res.device == X.device
+      4. Dtype: assert res.dtype == y.dtype (predict) or X.dtype (other)
+
+    Skipped when: fell_back, _SKIP(output_type), _SKIP(output_dtype),
+    regressor/clusterer predict, SVM decision_function, sparse, scalar.
+    est=None for standalone functions (e.g. pairwise_distances).
+    """
+    # Automated numpy-OK checks based on estimator type / method
+    if est is not None and is_clusterer(est) and method == "fit_predict":
+        # ClusterMixin.fit_predict returns self.labels_ (numpy)
+        return
+    if method == "apply":
+        # Tree apply returns integer leaf indices (numpy)
+        return
+    # Remaining known exceptions where numpy output is acceptable
+    if _should_skip(estimator_name, method, "output_type"):
+        return
+
+    # Methods that return self (e.g. partial_fit) are not array outputs
+    if isinstance(result, BaseEstimator):
+        return
+
+    input_type_y = type(y)
+
+    # Check if sklearn fallback occurred (any record in caplog)
+    fell_back = any(
+        "fallback to original Scikit-learn" in r.message for r in caplog.records
+    )
+
+    # Collect all array results (handle tuples like kneighbors)
+    if isinstance(result, (tuple, list)):
+        results_to_check = result
+    else:
+        results_to_check = (result,)
+
+    for res in results_to_check:
+        if res is None:
+            continue
+        # Skip scalar results
+        if np.isscalar(res):
+            continue
+        # Sparse outputs — verify sparse class matches sklearn config
+        if is_sparse(res):
+            if sklearn_check_version("1.9"):
+                sparse_iface = sklearn_get_config().get("sparse_interface", "spmatrix")
+                if sparse_iface == "sparray":
+                    assert isinstance(res, sp.sparray)
+                else:
+                    assert isinstance(res, sp.spmatrix)
+            continue
+
+        if fell_back:
+            # Fallback to sklearn: numpy output is acceptable
+            assert isinstance(res, (np.ndarray, input_type_y))
+        else:
+            # Accelerated version: output must match input type
+            assert isinstance(res, input_type_y)
+
+            # Check device alignment: if input was on GPU, output
+            # should also be on the same device. Uses standard array API
+            # `.device` attribute for compatibility with torch, dpnp, etc.
+            if hasattr(X, "device"):
+                assert hasattr(res, "device")
+                assert X.device == res.device
+
+            # Check dtype preservation (skip float16 — oneDAL doesn't
+            # support it natively and upcasts to float64)
+            x_is_fp16 = (
+                X is not None and hasattr(X, "dtype") and "float16" in str(X.dtype)
+            )
+            # Clusterers always return int cluster labels
+            # decision_path returns structural int output — skip dtype
+            if method == "decision_path":
+                continue
+            _skip_dtype = (
+                method == "predict"
+                and est is not None
+                and (
+                    is_clusterer(est)
+                    or (is_regressor(est) and "int" in str(getattr(y, "dtype", "")))
+                )
+            )
+            if (
+                hasattr(res, "dtype")
+                and not is_sparse(res)
+                and not x_is_fp16
+                and not _skip_dtype
+                and not _should_skip(estimator_name, method, "output_dtype")
+            ):
+                if method == "predict" and y is not None and hasattr(y, "dtype"):
+                    # predict output dtype should match y dtype
+                    assert res.dtype == y.dtype
+                elif X is not None and hasattr(X, "dtype") and "float" in str(X.dtype):
+                    # Only check float results against float X dtype;
+                    # int results (e.g. indices from kneighbors, labels
+                    # from fit_predict) are expected to differ.
+                    if "int" not in str(res.dtype):
+                        assert res.dtype == X.dtype
+
+
+# Unified skip rules: (estimator, name) -> set of checks to skip.
+# Checks: output_type, output_dtype, attr_type, attr_device, attr_dtype.
+_SKIP = {
+    # Output
+    ("DummyRegressor", "predict"): {"output_type"},
+    ("NearestNeighbors", "radius_neighbors"): {"output_type"},
+    ("ElasticNet", "path"): {"output_dtype"},
+    ("Lasso", "path"): {"output_dtype"},
+    ("IncrementalEmpiricalCovariance", "mahalanobis"): {"output_dtype"},
+    # Attr — always
+    ("DummyRegressor", "constant_"): {"attr_type", "attr_device", "attr_dtype"},
+    # Attr — specific
+    ("SVC", "n_iter_"): {"attr_device"},
+    ("NuSVC", "n_iter_"): {"attr_device"},
+    ("SVC", "probA_"): {"attr_device", "attr_dtype"},
+    ("SVC", "probB_"): {"attr_device", "attr_dtype"},
+    ("NuSVC", "probA_"): {"attr_device", "attr_dtype"},
+    ("NuSVC", "probB_"): {"attr_device", "attr_dtype"},
+    ("SVC", "class_weight_"): {"attr_dtype"},
+    ("NuSVC", "class_weight_"): {"attr_dtype"},
+}
+
+
+def _should_skip(estimator_name, name, check):
+    return check in _SKIP.get((estimator_name, name), set())
+
+
+# Attrs that must be arrays — assert not scalar.
+_ATTR_CHECK_MUST_BE_ARRAY = {
+    "coef_",
+    "intercept_",
+    "dual_coef_",
+    "support_vectors_",
+    "cluster_centers_",
+    "components_",
+    "singular_values_",
+    "explained_variance_",
+    "explained_variance_ratio_",
+    "mean_",
+    "labels_",
+    "class_weight_",
+}
+
+
+def _is_public_fitted_attr(attr_name, attr_val):
+    """Check if attribute is a public fitted array attribute."""
+    if not (attr_name[0].isalpha() and attr_name.endswith("_")):
+        return False
+    if not hasattr(attr_val, "dtype"):
+        return False
+    if np.isscalar(attr_val):
+        return False
+    return True
+
+
+def _check_sparse_class(attr_val):
+    """Verify sparse attr matches sklearn sparse_interface config."""
+    if sklearn_check_version("1.9"):
+        sparse_iface = sklearn_get_config().get("sparse_interface", "spmatrix")
+        if sparse_iface == "sparray":
+            assert isinstance(attr_val, sp.sparray)
+        else:
+            assert isinstance(attr_val, sp.spmatrix)
+
+
+def _should_skip_all_for_attr(
+    key, attr_name, est, is_non_numpy_input, fell_back, queue=None
+):
+    """Check if all type/device/dtype checks should be skipped for this attr."""
+    # classes_ is numpy without dispatch, correct type with dispatch
+    if attr_name == "classes_" and not sklearn_get_config().get(
+        "array_api_dispatch", False
+    ):
+        return True
+    if is_clusterer(est):
+        return True
+    if _should_skip(key[0], key[1], "attr_type"):
+        return True
+    if fell_back:
+        return True
+    return False
+
+
+def _should_skip_dtype_for_attr(key, attr_name, est, x_is_fp16):
+    """Check if dtype check should be skipped for this attr."""
+    if isinstance(est, BaseLibSVM):
+        return True
+    if x_is_fp16:
+        return True
+    if _should_skip(key[0], key[1], "attr_dtype"):
+        return True
+    return False
+
+
+def _check_fitted_attributes(est, X, estimator_name, caplog, queue=None):
+    """Check fitted attributes preserve input type, device, and dtype.
+
+    Call sequence for each attr:
+      1. Filter: skip non-public, non-array, scalar
+      2. Sparse: check class -> skip
+      3. Skip: _SKIP dict (attr_type, attr_device, attr_dtype),
+         classes_ (no dispatch), clusterers, fell_back -> skip
+      4. Type: assert isinstance(attr, input_type)
+      5. Device: assert attr.device == X.device (skip via _SKIP)
+      6. Dtype: assert attr.dtype == X.dtype (skip via _SKIP,
+         BaseLibSVM, fp16)
+    """
+    input_type = type(X)
+    xp, _ = get_namespace(X)
+    is_non_numpy_input = not isinstance(X, np.ndarray) and xp is not None
+
+    fell_back = any(
+        "fallback to original Scikit-learn" in r.message for r in caplog.records
+    )
+
+    x_is_fp16 = hasattr(X, "dtype") and "float16" in str(X.dtype)
+
+    for attr_name, attr_val in vars(est).items():
+        # Filter
+        if not _is_public_fitted_attr(attr_name, attr_val):
+            continue
+
+        # Assert attrs that must be arrays are not scalar
+        if attr_name in _ATTR_CHECK_MUST_BE_ARRAY:
+            assert hasattr(attr_val, "ndim") and attr_val.ndim > 0
+
+        # Sparse — check class then skip
+        if is_sparse(attr_val):
+            _check_sparse_class(attr_val)
+            continue
+
+        key = (estimator_name, attr_name)
+
+        # Known exceptions — skip all
+        if _should_skip_all_for_attr(
+            key, attr_name, est, is_non_numpy_input, fell_back, queue
+        ):
+            if fell_back:
+                assert isinstance(attr_val, (np.ndarray, input_type))
+            continue
+
+        # Type check
+        assert isinstance(attr_val, input_type)
+
+        # Device check
+        if (
+            not _should_skip(estimator_name, attr_name, "attr_device")
+            and hasattr(X, "device")
+            and hasattr(attr_val, "device")
+        ):
+            assert X.device == attr_val.device
+
+        # Dtype check
+        if not _should_skip_dtype_for_attr(key, attr_name, est, x_is_fp16):
+            if (
+                hasattr(attr_val, "dtype")
+                and "float" in str(attr_val.dtype)
+                and hasattr(X, "dtype")
+                and "float" in str(X.dtype)
+            ):
+                assert attr_val.dtype == X.dtype
+
+
+def _check_set_output_transform(est, method, X, estimator_name):
+    """Test set_output(transform=...) for transform methods.
+
+    Verifies that sklearn's set_output API is respected by sklearnex
+    estimators. When set_output(transform="pandas") is configured,
+    transform() should return a pandas DataFrame, etc.
+
+    Only applies to the 'transform' method (not fit_transform to avoid
+    refitting the estimator).
+    """
+    if method != "transform":
+        return
+    if not hasattr(est, "set_output"):
+        return
+
+    for transform_output in ["default", "pandas", "polars"]:
+        est.set_output(transform=transform_output)
+        try:
+            result = est.transform(X)
+        except Exception:
+            # Some input types (e.g., dpnp, array_api_strict) may not
+            # support conversion to the requested output format,
+            # or the output library (e.g., polars) may not be installed
+            continue
+
+        if transform_output == "pandas":
+            import pandas as pd
+
+            expected_type = pd.DataFrame
+        elif transform_output == "polars":
+            import polars as pl
+
+            expected_type = pl.DataFrame
+        else:
+            expected_type = None
+
+        if expected_type is not None:
+            assert isinstance(result, expected_type)
+
+    # Reset to default
+    est.set_output(transform="default")
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("dataframe, queue", get_dataframes_and_queues())
+@pytest.mark.parametrize(
+    "dataframe, queue", get_dataframes_and_queues("numpy,pandas", "cpu")
+)
 @pytest.mark.parametrize("estimator, method", gen_models_info(PATCHED_MODELS))
 def test_standard_estimator_patching(caplog, dataframe, queue, dtype, estimator, method):
-    with caplog.at_level(logging.WARNING, logger="sklearnex"):
-        est = PATCHED_MODELS[estimator]()
+    # numpy/pandas inputs run without array_api_dispatch; the array API frameworks
+    # are covered by test_standard_estimator_patching_array_api.
+    est = PATCHED_MODELS[estimator]()
 
-        if queue:
-            if dtype == np.float16 and not queue.sycl_device.has_aspect_fp16:
-                pytest.skip("Hardware does not support fp16 SYCL testing")
-            elif dtype == np.float64 and not queue.sycl_device.has_aspect_fp64:
-                pytest.skip("Hardware does not support fp64 SYCL testing")
-            elif queue.sycl_device.is_gpu and estimator in [
-                "KMeans",
-                "ElasticNet",
-                "Lasso",
-                "Ridge",
-            ]:
-                pytest.skip(f"{estimator} does not support GPU queues")
+    if "NearestNeighbors" in estimator and "radius" in method:
+        pytest.skip(f"RadiusNeighbors estimator not implemented in sklearnex")
 
-        if estimator == "TSNE" and method == "fit_transform":
-            pytest.skip("TSNE.fit_transform is too slow for common testing")
-        elif (
-            estimator == "Ridge"
-            and method in ["predict", "score"]
-            and sys.platform == "win32"
-            and dtype in [np.uint32, np.uint64]
-        ):
-            pytest.skip("Windows segmentation fault for Ridge.predict for unsigned ints")
-        elif estimator == "IncrementalLinearRegression" and dtype in [
-            np.int8,
-            np.int16,
-            np.int32,
-            np.int64,
-            np.uint8,
-            np.uint16,
-            np.uint32,
-            np.uint64,
+    if estimator == "TSNE" and method == "fit_transform":
+        pytest.skip("TSNE.fit_transform is too slow for common testing")
+    elif estimator == "IncrementalLinearRegression" and np.issubdtype(dtype, np.integer):
+        pytest.skip(
+            "IncrementalLinearRegression fails on oneDAL side with int types because dataset is filled by zeroes"
+        )
+    elif method and not hasattr(est, method) and not check_is_dynamic_method(est, method):
+        pytest.skip(f"sklearn available_if prevents testing {est}.{method}")
+
+    # numpy/pandas outputs are not required to preserve the input container type
+    # (sklearnex returns numpy), so only patching and set_output are verified here.
+    result, X, y = _check_estimator_patching(caplog, dataframe, queue, dtype, est, method)
+    _check_set_output_transform(est, method, X, estimator)
+
+
+@pytest.mark.skipif(
+    not _package_check_version("2.1", np.__version__),
+    reason="Array API functionality requires more recent version of NumPy.",
+)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("dataframe, queue", get_dataframes_and_queues("dpnp,array_api"))
+@pytest.mark.parametrize("estimator, method", gen_models_info(PATCHED_MODELS))
+def test_standard_estimator_patching_array_api(
+    with_array_api, caplog, dataframe, queue, dtype, estimator, method
+):
+    # array API inputs (dpnp, array_api_strict) run with array_api_dispatch enabled
+    # via the with_array_api fixture, so fit and all methods use array API natively.
+    kwargs = {}
+    if (
+        estimator == "LogisticRegression"
+        and queue
+        and getattr(queue.sycl_device, "is_gpu", False)
+    ):
+        # sklearnex.LogisticRegression only has support for newton-cg solver on GPU
+        kwargs = {"solver": "newton-cg"}
+    est = PATCHED_MODELS[estimator](**kwargs)
+
+    if queue:
+        if dtype == np.float16 and not queue.sycl_device.has_aspect_fp16:
+            pytest.skip("Hardware does not support fp16 SYCL testing")
+        elif dtype == np.float64 and not queue.sycl_device.has_aspect_fp64:
+            pytest.skip("Hardware does not support fp64 SYCL testing")
+        elif queue.sycl_device.is_gpu and estimator in [
+            "ElasticNet",
+            "Lasso",
         ]:
-            pytest.skip(
-                "IncrementalLinearRegression fails on oneDAL side with int types because dataset is filled by zeroes"
-            )
-        elif method and not hasattr(est, method):
-            pytest.skip(f"sklearn available_if prevents testing {estimator}.{method}")
+            pytest.skip(f"{estimator} does not support GPU queues")
 
-        X, y = gen_dataset(est, queue=queue, target_df=dataframe, dtype=dtype)
-        est.fit(X, y)
+    if "NearestNeighbors" in estimator and "radius" in method:
+        pytest.skip(f"RadiusNeighbors estimator not implemented in sklearnex")
 
-        if method:
-            if method != "score":
-                getattr(est, method)(X)
-            else:
-                est.score(X, y)
-    assert all(
-        [
-            "running accelerated version" in i.message
-            or "fallback to original Scikit-learn" in i.message
-            for i in caplog.records
-        ]
-    ), f"sklearnex patching issue in {estimator}.{method} with log: \n{caplog.text}"
+    if estimator == "TSNE" and method == "fit_transform":
+        pytest.skip("TSNE.fit_transform is too slow for common testing")
+    elif estimator == "IncrementalLinearRegression" and np.issubdtype(dtype, np.integer):
+        pytest.skip(
+            "IncrementalLinearRegression fails on oneDAL side with int types because dataset is filled by zeroes"
+        )
+    elif method and not hasattr(est, method) and not check_is_dynamic_method(est, method):
+        pytest.skip(f"sklearn available_if prevents testing {est}.{method}")
+
+    if estimator == "LogisticRegressionCV" and not get_tags(est).array_api_support:
+        pytest.skip("Array API and/or GPU inputs not supported in estimator")
+    if estimator == "LogisticRegression" and not sklearn_check_version("1.9"):
+        # Array API support for LogisticRegression in sklearn is only available
+        # starting from 1.9; before that sklearnex falls back to sklearn.
+        pytest.skip(
+            "Array API inputs are not supported for LogisticRegression in sklearn <1.9"
+        )
+
+    tags = get_tags(est)
+    array_api_check = (hasattr(tags, "array_api_support") and tags.array_api_support) or (
+        hasattr(tags, "onedal_array_api") and tags.onedal_array_api
+    )
+    if not array_api_check:
+        pytest.skip(
+            "Array API support not implemented in either scikit-learn or scikit-learn-intelex"
+        )
+
+    try:
+        result, X, y = _check_estimator_patching(
+            caplog, dataframe, queue, dtype, est, method
+        )
+    except Exception as e:
+        # if we are borrowing from sklearn and it fails, then this is something
+        # failing on sklearn-side. It is only allowed to fail if the underlying sklearn
+        # function doesn't support array_api with the set parameters and array_api
+        # support isn't promised by oneDAL
+        if estimator not in UNPATCHED_MODELS or getattr(
+            PATCHED_MODELS[estimator], method
+        ) != getattr(UNPATCHED_MODELS[estimator], method, None):
+            raise e
+    else:
+        # Estimators without GPU fit support (e.g. neighbors) host-transfer and
+        # return numpy on GPU inputs, so output-type conformance does not apply.
+        if queue is not None and getattr(queue.sycl_device, "is_gpu", False):
+            X_np, y_np = _as_numpy(X), _as_numpy(y)
+            if not est._onedal_gpu_supported("fit", X_np, y_np, None).get_status():
+                _check_set_output_transform(est, method, X, estimator)
+                return
+        # Check return type conformance when no exception occurred. Output arrays
+        # should match the input array type.
+        _check_output_type(result, y, method, estimator, caplog, X=X, est=est)
+        _check_fitted_attributes(est, X, estimator, caplog, queue=queue)
+        _check_set_output_transform(est, method, X, estimator)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("dataframe, queue", get_dataframes_and_queues())
+@pytest.mark.parametrize(
+    "dataframe, queue", get_dataframes_and_queues("numpy,pandas", "cpu")
+)
 @pytest.mark.parametrize("estimator, method", gen_models_info(SPECIAL_INSTANCES))
 def test_special_estimator_patching(caplog, dataframe, queue, dtype, estimator, method):
-    # prepare logging
+    # numpy/pandas inputs run without array_api_dispatch; the array API frameworks
+    # are covered by test_special_estimator_patching_array_api.
+    est = SPECIAL_INSTANCES[estimator]
 
-    with caplog.at_level(logging.WARNING, logger="sklearnex"):
-        est = SPECIAL_INSTANCES[estimator]
+    if "NearestNeighbors" in estimator and "radius" in method:
+        pytest.skip(f"RadiusNeighbors estimator not implemented in sklearnex")
 
-        # Its not possible to get the dpnp/dpctl arrays to be in the proper dtype
-        if dtype == np.float16 and queue and not queue.sycl_device.has_aspect_fp16:
+    _check_estimator_patching(caplog, dataframe, queue, dtype, est, method)
+
+
+@pytest.mark.skipif(
+    not _package_check_version("2.1", np.__version__),
+    reason="Array API functionality requires more recent version of NumPy.",
+)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("dataframe, queue", get_dataframes_and_queues("dpnp,array_api"))
+@pytest.mark.parametrize("estimator, method", gen_models_info(SPECIAL_INSTANCES))
+def test_special_estimator_patching_array_api(
+    with_array_api, caplog, dataframe, queue, dtype, estimator, method
+):
+    # array API inputs (dpnp, array_api_strict) run with array_api_dispatch enabled
+    # via the with_array_api fixture.
+    est = SPECIAL_INSTANCES[estimator]
+
+    if queue:
+        # Its not possible to get the dpnp arrays to be in the proper dtype
+        if dtype == np.float16 and not queue.sycl_device.has_aspect_fp16:
             pytest.skip("Hardware does not support fp16 SYCL testing")
-        elif dtype == np.float64 and queue and not queue.sycl_device.has_aspect_fp64:
+        elif dtype == np.float64 and not queue.sycl_device.has_aspect_fp64:
             pytest.skip("Hardware does not support fp64 SYCL testing")
 
-        X, y = gen_dataset(est, queue=queue, target_df=dataframe, dtype=dtype)
-        est.fit(X, y)
+    if "NearestNeighbors" in estimator and "radius" in method:
+        pytest.skip(f"RadiusNeighbors estimator not implemented in sklearnex")
 
-        if method and not hasattr(est, method):
-            pytest.skip(f"sklearn available_if prevents testing {estimator}.{method}")
-
-        if method:
-            if method != "score":
-                getattr(est, method)(X)
-            else:
-                est.score(X, y)
-
-    assert all(
-        [
-            "running accelerated version" in i.message
-            or "fallback to original Scikit-learn" in i.message
-            for i in caplog.records
-        ]
-    ), f"sklearnex patching issue in {estimator}.{method} with log: \n{caplog.text}"
+    try:
+        _check_estimator_patching(caplog, dataframe, queue, dtype, est, method)
+    except Exception as e:
+        # These special-instance methods are not array API viable in stock sklearn
+        # itself (they raise a TypeError under array_api_dispatch), so the failure is
+        # a sklearn conformance gap rather than a sklearnex regression. Any other
+        # failure is real and re-raised.
+        if (type(est).__name__, method) not in _SKLEARN_ARRAY_API_GAPS:
+            raise e
 
 
 @pytest.mark.parametrize("estimator", UNPATCHED_MODELS.keys())
@@ -278,10 +723,6 @@ def test_standard_estimator_init_signatures(estimator):
     ],
 )
 def test_patched_function_signatures(function):
-    # certain functions are dropped from the test
-    # as they add functionality to the underlying sklearn function
-    if not sklearn_check_version("1.1") and function == "_assert_all_finite":
-        pytest.skip("Sklearn versioning not added to _assert_all_finite")
     func = PATCHED_FUNCTIONS[function]
     unpatched_func = UNPATCHED_FUNCTIONS[function]
 
@@ -298,9 +739,17 @@ def test_patch_map_match():
 
     def list_all_attr(string):
         try:
-            modules = set(importlib.import_module(string).__all__)
+            mod = importlib.import_module(string)
         except ModuleNotFoundError:
-            modules = set([None])
+            return set([None])
+
+        # Some sklearn estimators exist in python
+        # files rather than folders under sklearn
+        modules = set(
+            getattr(
+                mod, "__all__", [name for name in dir(mod) if not name.startswith("_")]
+            )
+        )
         return modules
 
     if _is_preview_enabled():
@@ -311,11 +760,6 @@ def test_patch_map_match():
     sklearn__all__ = list_all_attr("sklearn")
 
     module_map = {i: i for i in sklearnex__all__.intersection(sklearn__all__)}
-
-    # _assert_all_finite patches an internal sklearn function which isn't
-    # exposed via __all__ in sklearn. It is a special case where this rule
-    # is not applied (e.g. it is grandfathered in).
-    del patched["_assert_all_finite"]
 
     # remove all scikit-learn-intelex-only estimators
     for i in patched.copy():
@@ -386,5 +830,5 @@ def test_docstring_patching_match(estimator):
 )
 def test_onedal_supported_member(name, member):
     patched = PATCHED_MODELS[name]
-    sig = str(inspect.signature(getattr(patched, member)))
+    sig = str(signature(getattr(patched, member)))
     assert "(self, method_name, *data)" == sig

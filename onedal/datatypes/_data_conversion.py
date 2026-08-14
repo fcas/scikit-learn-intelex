@@ -14,78 +14,169 @@
 # limitations under the License.
 # ==============================================================================
 
-import warnings
-
 import numpy as np
+import scipy.sparse as sp
 
-from daal4py.sklearn._utils import make2d
-from onedal import _backend, _is_dpc_backend
-
-try:
-    import dpctl
-    import dpctl.tensor as dpt
-
-    dpctl_available = dpctl.__version__ >= "0.14"
-except ImportError:
-    dpctl_available = False
+from .. import _default_backend as backend
+from ..utils._third_party import is_dpnp_ndarray, lazy_import
+from ._dlpack import cpu_dlpack_device
 
 
-def _apply_and_pass(func, *args):
+def _apply_and_pass(func, *args, **kwargs):
     if len(args) == 1:
-        return func(args[0])
-    return tuple(map(func, args))
+        return func(args[0], **kwargs)
+    return tuple(map(lambda arg: func(arg, **kwargs), args))
 
 
-def from_table(*args):
-    return _apply_and_pass(_backend.from_table, *args)
+def _convert_one_to_table(arg, queue=None):
+    # All inputs for table conversion must be array-like or sparse, not scalars
+    return backend.to_table(np.atleast_2d(arg) if np.isscalar(arg) else arg, queue)
 
 
-def convert_one_to_table(arg):
-    if dpctl_available:
-        if isinstance(arg, dpt.usm_ndarray):
-            return _backend.dpctl_to_table(arg)
-    arg = make2d(arg)
-    return _backend.to_table(arg)
+def to_table(*args, queue=None):
+    """Create oneDAL tables from scalars and/or arrays.
+
+    Parameters
+    ----------
+    *args : scalar, numpy array, sycl_usm_ndarray, csr_matrix, or csr_array
+        Arguments to be individually converted to oneDAL tables.
+
+    queue : SyclQueue or None, default=None
+        SYCL Queue object to be associated with the oneDAL tables. Default
+        value None causes no change in data location or queue.
+
+    Returns
+    -------
+    tables : oneDAL homogeneous or csr tables
+        Converted oneDAL tables for scalar, numpy array, sycl_usm_ndarray
+        and dlpack inputs; oneDAL csr_table for csr_matrix, csr_array.
+
+    Notes
+    -----
+        Tables will use pointers to the original array data. Scalars
+        and non-contiguous arrays will be copies. Arrays may be
+        modified in-place by oneDAL during computation. Transformation
+        is possible only for data located on CPU and SYCL-enabled Intel
+        GPUs. Each array may only be of a single data type (i.e. each
+        must be homogeneous).
+    """
+    return _apply_and_pass(_convert_one_to_table, *args, queue=queue)
 
 
-def to_table(*args):
-    return _apply_and_pass(convert_one_to_table, *args)
+# Note: pytorch is not fully array API compatible, and will be handled
+# by this converter. The 'from_dlpack' function from this 'compat'
+# module does not work with all possible types that oneDAL produces as
+# tables if it gets passed the 'device' argument, so this does a second
+# conversion round to ensure same device, but this may involve data
+# movements - for example, the first 'from_dlpack' might return a CPU
+# array that the second conversion might move to device.
+# Perhaps a better solution could be created on the C++ convertor's
+# side, but at the moment not every conversion works.
+@lazy_import("array_api_compat")
+def _compat_convert(array_api_compat, array):
+    def converter_func(x):
+        xp = array_api_compat.get_namespace(array)
+        out = xp.from_dlpack(x)
+        if out.device != array.device:
+            out = xp.from_dlpack(out, device=array.device)
+        return out
+
+    return converter_func
 
 
-if _is_dpc_backend:
-    from ..common._policy import _HostInteropPolicy
+def return_type_constructor(array):
+    """Generate a function for converting oneDAL tables to arrays.
 
-    def _convert_to_supported(policy, *data):
-        def func(x):
-            return x
+    Parameters
+    ----------
+    array : array-like or None
+        Python object representing an array instance of the return type
+        for converting oneDAL tables. Arrays are queried for conversion
+        namespace when of sycl_usm_array type or array API standard type.
+        When set to None, will return numpy arrays or scipy csr arrays.
 
-        # CPUs support FP64 by default
-        if isinstance(policy, _HostInteropPolicy):
-            return _apply_and_pass(func, *data)
+    Returns
+    -------
+    func : callable
+        A function which takes in a single table input and returns an array.
+    """
+    if isinstance(array, np.ndarray) or array is None or sp.issparse(array):
+        func = backend.from_table
+    elif hasattr(array, "__sycl_usm_array_interface__"):
+        # oneDAL returns tables without sycl queues for CPU sycl queue inputs.
+        # This workaround is necessary for the functional preservation
+        # of the compute-follows-data execution.
+        device = array.sycl_queue
+        # Its important to note why the __sycl_usm_array_interface__ is
+        # prioritized: it provides finer-grained control of SYCL queues and the
+        # related SYCL devices which are generally unavailable via DLPack
+        # representations (such as SYCL contexts, SYCL sub-devices, etc.).
+        xp = array.__array_namespace__()
+        # array api support added in dpnp starting in 0.19, will fail for
+        # older versions
+        if is_dpnp_ndarray(array):
+            func = lambda x: (
+                xp.asarray(xp.as_usm_ndarray(x))
+                if hasattr(x, "__sycl_usm_array_interface__")
+                else xp.asarray(backend.from_table(x), device=device)
+            )
 
-        # It can be either SPMD or DPCPP policy
-        device = policy._queue.sycl_device
+    elif hasattr(array, "__array_namespace__"):
+        xp = array.__array_namespace__()
+        device = array.device
 
-        def convert_or_pass(x):
-            if (x is not None) and (x.dtype == np.float64):
-                warnings.warn(
-                    "Data will be converted into float32 from "
-                    "float64 because device does not support it",
-                    RuntimeWarning,
-                )
-                return x.astype(np.float32)
-            else:
-                return x
+        def func(inp):
+            # Some array API libraries (e.g. array_api_strict) do not forward
+            # the 'device' argument of their 'from_dlpack' to the exporter's
+            # '__dlpack__', so a oneDAL table on a SYCL device never gets asked
+            # to transfer to host when the target namespace is host-only.
+            # NumPy's 'from_dlpack' does forward it, so route through NumPy
+            # first in that case, then hand the resulting host array to 'xp'.
+            if (
+                inp.__dlpack_device__() != cpu_dlpack_device
+                and array.__dlpack_device__() == cpu_dlpack_device
+            ):
+                return xp.asarray(np.from_dlpack(inp, device="cpu"), device=device)
+            return xp.from_dlpack(inp, device=device)
 
-        if not device.has_aspect_fp64:
-            func = convert_or_pass
+    else:
+        try:
+            func = _compat_convert(array)
+        except ImportError:
+            raise TypeError(
+                "array type is unsupported, but may be made compatible by installing `array_api_compat`"
+            ) from None
+    return func
 
-        return _apply_and_pass(func, *data)
 
-else:
+def from_table(*args, like=None):
+    """Create 2 dimensional arrays from oneDAL tables.
 
-    def _convert_to_supported(policy, *data):
-        def func(x):
-            return x
+    oneDAL tables are converted to numpy ndarrays, dpnp ndarrays,
+    or array API standard arrays of designated type.
 
-        return _apply_and_pass(func, *data)
+    Parameters
+    ----------
+    *args : single or multiple python oneDAL tables
+        The tables should given as individual arguments.
+
+    like : callable, array-like or None, default=None
+        Python object representing an array instance of the return type
+        or function capable of converting oneDAL tables into arrays of
+        desired type. Arrays are queried for conversion namespace when
+        of sycl_usm_array type or array API standard type. When set to
+        None, will return numpy arrays or scipy csr arrays.
+
+    Returns
+    -------
+    arrays : numpy arrays, sycl_usm_ndarrays, or array API standard arrays
+        Array or tuple of arrays generated from the input oneDAL tables.
+
+    Notes
+    -----
+    Support for other array types via array_api_compat is possible (e.g.
+    PyTorch), but requires its installation specifically, as it is imported
+    only when necessary.
+    """
+    func = like if callable(like) else return_type_constructor(like)
+    return _apply_and_pass(func, *args)

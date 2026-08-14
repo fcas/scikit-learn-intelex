@@ -135,6 +135,17 @@ void init_train_ops(py::module_& m) {
               train_ops ops(policy, input_t{ data, responses, weights }, params2desc{});
               return fptype2t{ method2t{ Task{}, kernel2t{ ops } } }(params);
           });
+    m.def("train",
+          [](const Policy& policy,
+             const py::dict& params,
+             const table& data,
+             const table& responses) {
+              using namespace dal::svm;
+              using input_t = train_input<Task>;
+
+              train_ops ops(policy, input_t{ data, responses }, params2desc{});
+              return fptype2t{ method2t{ Task{}, kernel2t{ ops } } }(params);
+          });
 }
 
 template <typename Policy, typename Task>
@@ -199,6 +210,9 @@ void init_train_result(py::module_& m) {
         .DEF_ONEDAL_PY_PROPERTY(model, result_t)
         .DEF_ONEDAL_PY_PROPERTY(support_vectors, result_t)
         .DEF_ONEDAL_PY_PROPERTY(support_indices, result_t)
+#if defined(ONEDAL_VERSION) && ONEDAL_VERSION >= 20260000
+        .DEF_ONEDAL_PY_PROPERTY(iteration_counts, result_t)
+#endif
         .DEF_ONEDAL_PY_PROPERTY(coeffs, result_t)
         .DEF_ONEDAL_PY_PROPERTY(biases, result_t);
 }
@@ -239,14 +253,14 @@ ONEDAL_PY_INIT_MODULE(svm) {
         types<task::classification, task::regression, task::nu_classification, task::nu_regression>;
     auto sub = m.def_submodule("svm");
 
-    #ifndef ONEDAL_DATA_PARALLEL_SPMD
-        ONEDAL_PY_INSTANTIATE(init_train_ops, sub, policy_list, task_list);
-        ONEDAL_PY_INSTANTIATE(init_infer_ops, sub, policy_list, task_list);
+#ifndef ONEDAL_DATA_PARALLEL_SPMD
+    ONEDAL_PY_INSTANTIATE(init_train_ops, sub, policy_list, task_list);
+    ONEDAL_PY_INSTANTIATE(init_infer_ops, sub, policy_list, task_list);
 
-        ONEDAL_PY_INSTANTIATE(init_model, sub, task_list);
-        ONEDAL_PY_INSTANTIATE(init_train_result, sub, task_list);
-        ONEDAL_PY_INSTANTIATE(init_infer_result, sub, task_list);
-    #endif
+    ONEDAL_PY_INSTANTIATE(init_model, sub, task_list);
+    ONEDAL_PY_INSTANTIATE(init_train_result, sub, task_list);
+    ONEDAL_PY_INSTANTIATE(init_infer_result, sub, task_list);
+#endif
 }
 
 ONEDAL_PY_TYPE2STR(dal::svm::task::classification, "classification");

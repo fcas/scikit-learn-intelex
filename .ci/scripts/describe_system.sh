@@ -49,7 +49,16 @@ if [ -x "$(command -v clang)" ]; then
     echo "Clang:"
     clang --version
 fi
+if [ -x "$(command -v icx)" ]; then
+    echo "ICX:"
+    icx --version
+fi
 if [ -x "$(command -v icpx)" ]; then
     echo "ICPX:"
     icpx --version
+fi
+echo
+# SYCL devices
+if [ -x "$(command -v sycl-ls)" ]; then
+    sycl-ls
 fi

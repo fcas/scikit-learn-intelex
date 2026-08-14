@@ -14,58 +14,100 @@
 # limitations under the License.
 #===============================================================================
 steps:
-  - script: sudo apt-get update && sudo apt-get install -y clang-format
+  - script: sudo apt-get update
     displayName: "apt-get"
   - script: |
-      bash .ci/scripts/install_dpcpp.sh
-    displayName: "dpcpp installation"
-  - script: |
-      bash .ci/scripts/describe_system.sh
-    displayName: "System info"
-  - script: |
+      # set defaults to guarantee use of conda-forge
+      echo -e "default_channels:\n  - https://conda.anaconda.org/conda-forge" >> ~/.condarc
+      conda config --add channels conda-forge
+      conda config --set channel_priority strict
       conda update -y -q conda
-      conda create -q -y -n CB -c conda-forge -c intel python=$(PYTHON_VERSION) intel::dal-devel mpich pyyaml "dpcpp-cpp-rt=2024.1.0"
+      conda create -q -y -n CB -c conda-forge python=$(PYTHON_VERSION) mpich pip setuptools wheel
     displayName: "Conda create"
   - script: |
       . /usr/share/miniconda/etc/profile.d/conda.sh
       conda activate CB
+      # DPC builds need dal-devel (pulls dal, dal-include, dal-gpu, mkl-dpcpp) plus the dpcpp compiler; CPU-only builds need just dal + dal-include.
+      # TODO: mkl-dpcpp is requested explicitly to nudge the solver toward the dal-gpu build that lists it as a runtime dep; remove once dal-gpu2026.1 is released in conda-forge
+      if [ -z "${DALROOT}" ]; then
+        if [ -z "${NO_DPC}" ]; then
+          conda install -q -y -c conda-forge dal-devel mkl-dpcpp dpcpp_linux-64=$DPCPP_VERSION
+        else
+          conda install -q -y -c conda-forge dal dal-include
+        fi
+      fi
       pip install -r dependencies-dev
-      pip list
+      conda list
+    env:
+      NO_DPC: ${{ variables.NO_DPC }}
+      DALROOT: ${{ variables.DALROOT }}
+      DPCPP_VERSION: 2026.0.0
     displayName: "Install develop requirements"
   - script: |
-      export DPCPPROOT=/opt/intel/oneapi/compiler/latest
       . /usr/share/miniconda/etc/profile.d/conda.sh
       conda activate CB
-      export DALROOT=$CONDA_PREFIX
+      bash .ci/scripts/describe_system.sh
+    displayName: "System info"
+  - script: |
+      . /usr/share/miniconda/etc/profile.d/conda.sh
+      conda activate CB
+      if [ -z "${DALROOT}" ]; then export DALROOT=$CONDA_PREFIX; fi
       ./conda-recipe/build.sh
-      python setup_sklearnex.py install --single-version-externally-managed --record=record_sklearnex.txt
+    env:
+      NO_DPC: ${{ variables.NO_DPC }}
+      NO_DIST: ${{ variables.NO_DIST }}
+      DPCPPROOT: ${{ variables.DPCPPROOT }}
+      DALROOT: ${{ variables.DALROOT }}
     displayName: "Build daal4py/sklearnex"
   - script: |
       . /usr/share/miniconda/etc/profile.d/conda.sh
       conda activate CB
       bash .ci/scripts/setup_sklearn.sh $(SKLEARN_VERSION)
+      # TODO: drop the intel python channel once dpnp is published on conda-forge, and drop the PYTHON_VERSION guard once dpctl ships a py3.14 build.
+      # conda install runs before pip so that pip's pins (incl. the numpy 1.x runtime version) take final precedence.
+      if [ $(echo $(PYTHON_VERSION) | grep '3.10\|3.11\|3.12\|3.13') ] && [ -z ${NO_DPC} ]; then conda install -q -y -c conda-forge -c https://software.repos.intel.com/python/conda/ dpctl=$DPCTL_VERSION dpnp=$DPNP_VERSION; fi
       pip install --upgrade -r requirements-test.txt
-      pip install $(python .ci/scripts/get_compatible_scipy_version.py)
-      if [ $(echo $(PYTHON_VERSION) | grep '3.9\|3.10') ]; then conda install -q -y -c intel dpctl=0.16.0 dpnp=0.14.0; fi
-      pip list
+      conda list
+    env:
+      NO_DPC: ${{ variables.NO_DPC }}
+      DPCTL_VERSION: 0.22.1
+      DPNP_VERSION: 0.20.0
     displayName: "Install testing requirements"
   - script: |
       . /usr/share/miniconda/etc/profile.d/conda.sh
       conda activate CB
+      if [ -n "${COVERAGE_RCFILE}" ]; then export COVERAGE_FILE=$(pwd)/.coverage.sklearnex; fi
       cd ..
-      ./s/conda-recipe/run_test.sh
+      if [ -n "${TBBROOT}" ] && [ "${TBBROOT}" != "${CONDA_PREFIX}" ]; then source ${TBBROOT}/env/vars.sh; fi
+      ./s/conda-recipe/run_test.sh --json-report
+    env:
+      TBBROOT: ${{ variables.TBBROOT }}
+      COVERAGE_RCFILE: ${{ variables.COVERAGE_RCFILE }}
+      NO_DPC: ${{ variables.NO_DPC }}
+      NO_DIST: 1
     displayName: "Sklearnex testing"
   - script: |
       . /usr/share/miniconda/etc/profile.d/conda.sh
       conda activate CB
-      bash .ci/scripts/run_sklearn_tests.sh cpu
+      if [ -n "${TBBROOT}" ] && [ "${TBBROOT}" != "${CONDA_PREFIX}" ]; then source ${TBBROOT}/env/vars.sh; fi
+      if [ -n "${COVERAGE_RCFILE}" ]; then export COVERAGE_FILE=$(pwd)/.coverage.sklearn; fi
+      if [ -z "${NO_DPC}" ]; then export CPU="cpu"; fi
+      bash .ci/scripts/run_sklearn_tests.sh $CPU
+    env:
+      TBBROOT: ${{ variables.TBBROOT }}
+      COVERAGE_RCFILE: ${{ variables.COVERAGE_RCFILE }}
+      NO_DPC: ${{ variables.NO_DPC }}
     displayName: "Sklearn testing"
     condition: succeededOrFailed()
   - script: |
       . /usr/share/miniconda/etc/profile.d/conda.sh
       conda activate CB
-      bash .ci/scripts/run_sklearn_tests.sh cpu
+      if [ -n "${TBBROOT}" ] && [ "${TBBROOT}" != "${CONDA_PREFIX}" ]; then source ${TBBROOT}/env/vars.sh; fi
+      if [ -z "${NO_DPC}" ]; then export CPU="cpu"; fi
+      bash .ci/scripts/run_sklearn_tests.sh $CPU
     env:
+      TBBROOT: ${{ variables.TBBROOT }}
+      NO_DPC: ${{ variables.NO_DPC }}
       SKLEARNEX_PREVIEW: "YES"
     displayName: "Sklearn testing [preview]"
     condition: succeededOrFailed()

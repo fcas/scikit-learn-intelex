@@ -18,6 +18,7 @@ import unittest
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import daal4py as d4p
 
@@ -80,7 +81,6 @@ class Test(unittest.TestCase):
         X = np.random.randn(13024 * 3, 16)
         df = pd.DataFrame(X[1::3, 1:])
         ps = pd.Series(X[1::3, 0])
-        print(ps.to_numpy().flags)
         self.verify_on_linear_regression(df, ps)
 
     def test_contiguous_heterogeneous(self):
@@ -133,6 +133,10 @@ class Test(unittest.TestCase):
             assert np.allclose(df[n].values, X[:, i])
         self.verify_on_dbscan(df)
 
+    @pytest.mark.xfail(
+        int(pd.__version__.split(".")[0]) >= 3,
+        reason="Pandas 3.0+ uses copy-on-write by default, breaking memory sharing",
+    )
     def test_to_numpy_not_copy(self):
         """
         Check own data for to_numpy method

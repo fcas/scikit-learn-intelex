@@ -16,11 +16,12 @@
 
 from warnings import warn
 
-import dpctl.tensor as dpt
+import dpnp
 import numpy as np
 from dpctl import SyclQueue
 from mpi4py import MPI
 
+from sklearnex import config_context
 from sklearnex.spmd.linear_model import LinearRegression
 
 
@@ -60,17 +61,20 @@ X, y = get_train_data(rank)
 
 queue = SyclQueue("gpu")
 
-dpt_X = dpt.asarray(X, usm_type="device", sycl_queue=queue)
-dpt_y = dpt.asarray(y, usm_type="device", sycl_queue=queue)
+dpnp_X = dpnp.asarray(X, usm_type="device", sycl_queue=queue)
+dpnp_y = dpnp.asarray(y, usm_type="device", sycl_queue=queue)
 
-model = LinearRegression().fit(dpt_X, dpt_y)
+# Array API dispatch keeps dpnp data on device throughout the computation.
+# The SCIPY_ARRAY_API environment variable must also be set to enable this.
+with config_context(array_api_dispatch=True):
+    model = LinearRegression().fit(dpnp_X, dpnp_y)
 
-print(f"Coefficients on rank {rank}:\n", model.coef_)
-print(f"Intercept on rank {rank}:\n", model.intercept_)
+    print(f"Coefficients on rank {rank}:\n", model.coef_)
+    print(f"Intercept on rank {rank}:\n", model.intercept_)
 
-X_test, _ = get_test_data(rank)
-dpt_X_test = dpt.asarray(X_test, usm_type="device", sycl_queue=queue)
+    X_test, _ = get_test_data(rank)
+    dpnp_X_test = dpnp.asarray(X_test, usm_type="device", sycl_queue=queue)
 
-result = model.predict(dpt_X_test)
+    result = model.predict(dpnp_X_test)
 
-print(f"Result on rank {rank}:\n", dpt.to_numpy(result))
+    print(f"Result on rank {rank}:\n", result)

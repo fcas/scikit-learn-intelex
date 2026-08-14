@@ -15,3 +15,8 @@
 # ===============================================================================
 
 from daal4py.sklearn.manifold import TSNE
+
+from ..base import oneDALEstimator
+
+TSNE._doc_link_module = "daal4py"
+TSNE._doc_link_url_param_generator = oneDALEstimator._doc_link_url_param_generator

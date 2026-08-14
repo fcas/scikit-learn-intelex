@@ -15,23 +15,19 @@
 # ==============================================================================
 
 import logging
+import sys
 import threading
 from functools import wraps
 from inspect import Parameter, signature
-from multiprocessing import cpu_count
 from numbers import Integral
 from warnings import warn
 
 import threadpoolctl
+from joblib import cpu_count
+from sklearn.utils._param_validation import validate_parameter_constraints
 
 from daal4py import daalinit as set_n_threads
 from daal4py import num_threads as get_n_threads
-
-from ._utils import sklearn_check_version
-
-if sklearn_check_version("1.2"):
-    from sklearn.utils._param_validation import validate_parameter_constraints
-
 
 # Note: getting controller in global scope of this module is required
 # to avoid overheads by its initialization per each function call
@@ -45,24 +41,26 @@ def get_suggested_n_threads(n_cpus):
     Usually, limit is equal to `n_logical_cpus` // `n_jobs`.
     Returns None if limit is not set.
     """
-    n_threads_map = {
-        lib_ctl.internal_api: lib_ctl.get_num_threads()
-        for lib_ctl in threadpool_controller.lib_controllers
-        if lib_ctl.internal_api != "mkl"
-    }
-    # openBLAS is limited to 24, 64 or 128 threads by default
-    # depending on SW/HW configuration.
-    # thus, these numbers of threads from openBLAS are uninformative
-    if "openblas" in n_threads_map and n_threads_map["openblas"] in [24, 64, 128]:
-        del n_threads_map["openblas"]
-    # remove default values equal to n_cpus as uninformative
-    for backend in list(n_threads_map.keys()):
-        if n_threads_map[backend] == n_cpus:
-            del n_threads_map[backend]
-    if len(n_threads_map) > 0:
-        return min(n_threads_map.values())
-    else:
-        return None
+
+    # Comment 2025-11-18: as of joblib>=1.5.2, by the point that this section
+    # is reached under a joblib job (e.g. as triggered by sklearn metaestimators)
+    # or under a threadpoolctl context that doesn't specify 'api', limits for
+    # openmp will always be set - in the case of joblib, to the number of threads
+    # divided by the number of parallel jobs, and in the case of threadpoolctl,
+    # to the number that is passed under the context. However, limits for other
+    # components like 'openblas' would be set under some setups but not others
+    # (e.g. if installing SciPy from pip with its bundled openblas, but not if
+    # installing it from conda-forge with MKL as BLAS backend), and might be set
+    # by the user to something that doesn't match with the number of parallel
+    # jobs from joblib - hence this looks at the openmp configuration, even
+    # though openmp is not used by oneDAL.
+    for lib_ctl in threadpool_controller.lib_controllers:
+        if lib_ctl.internal_api == "openmp":
+            n_threads = lib_ctl.get_num_threads()
+            # remove default values equal to n_cpus as uninformative
+            if n_threads is not None and n_threads != n_cpus:
+                return n_threads
+    return None
 
 
 def _run_with_n_jobs(method):
@@ -76,12 +74,12 @@ def _run_with_n_jobs(method):
     """
 
     @wraps(method)
-    def method_wrapper(self, *args, **kwargs):
+    def n_jobs_wrapper(self, *args, **kwargs):
         # threading parallel backend branch
         if not isinstance(threading.current_thread(), threading._MainThread):
             warn(
                 "'Threading' parallel backend is not supported by "
-                "Intel(R) Extension for Scikit-learn*. "
+                "Extension for scikit-learn*. "
                 "Falling back to usage of all available threads."
             )
             result = method(self, *args, **kwargs)
@@ -90,7 +88,7 @@ def _run_with_n_jobs(method):
         # preemptive validation of n_jobs parameter is required
         # because '_run_with_n_jobs' decorator is applied on top of method
         # where validation takes place
-        if sklearn_check_version("1.2") and hasattr(self, "_parameter_constraints"):
+        if hasattr(self, "_parameter_constraints"):
             validate_parameter_constraints(
                 parameter_constraints={"n_jobs": self._parameter_constraints["n_jobs"]},
                 params={"n_jobs": self.n_jobs},
@@ -117,7 +115,10 @@ def _run_with_n_jobs(method):
                 n_jobs = max(1, n_threads + n_jobs + 1)
         # branch with set n_jobs
         old_n_threads = get_n_threads()
-        if n_jobs != old_n_threads:
+        if n_jobs == old_n_threads:
+            return method(self, *args, **kwargs)
+
+        try:
             logger = logging.getLogger("sklearnex")
             cl = self.__class__
             logger.debug(
@@ -125,12 +126,11 @@ def _run_with_n_jobs(method):
                 f"setting {n_jobs} threads (previous - {old_n_threads})"
             )
             set_n_threads(n_jobs)
-        result = method(self, *args, **kwargs)
-        if n_jobs != old_n_threads:
+            return method(self, *args, **kwargs)
+        finally:
             set_n_threads(old_n_threads)
-        return result
 
-    return method_wrapper
+    return n_jobs_wrapper
 
 
 def control_n_jobs(decorated_methods: list = []):
@@ -138,7 +138,7 @@ def control_n_jobs(decorated_methods: list = []):
     Decorator for controlling the 'n_jobs' parameter in an estimator class.
 
     This decorator is designed to be applied to both estimators with and without
-    native support for the 'n_jobs' parameter in the original Scikit-learn APIs.
+    native support for the 'n_jobs' parameter in the original scikit-learn APIs.
     When applied to an estimator without 'n_jobs' support in
     its original '__init__' method, this decorator adds the 'n_jobs' parameter.
 
@@ -149,7 +149,8 @@ def control_n_jobs(decorated_methods: list = []):
 
     Parameters
     ----------
-        decorated_methods (list): A list of method names to be executed with 'n_jobs'.
+    decorated_methods: list
+        A list of method names to be executed with 'n_jobs'.
 
     Example
     -------
@@ -176,9 +177,7 @@ def control_n_jobs(decorated_methods: list = []):
 
         original_init = original_class.__init__
 
-        if sklearn_check_version("1.2") and hasattr(
-            original_class, "_parameter_constraints"
-        ):
+        if hasattr(original_class, "_parameter_constraints"):
             parameter_constraints = original_class._parameter_constraints
             if "n_jobs" not in parameter_constraints:
                 parameter_constraints["n_jobs"] = [Integral, None]
@@ -209,14 +208,20 @@ def control_n_jobs(decorated_methods: list = []):
             and isinstance(original_class.__doc__, str)
             and "n_jobs : int" not in original_class.__doc__
         ):
-            parameters_doc_tail = "\n    Attributes"
-            n_jobs_doc = """
-    n_jobs : int, default=None
-        The number of jobs to use in parallel for the computation.
-        ``None`` means using all physical cores
-        unless in a :obj:`joblib.parallel_backend` context.
-        ``-1`` means using all logical cores.
-        See :term:`Glossary <n_jobs>` for more details.
+            # Python 3.13 removed extra tab in class doc string
+            tab = (
+                "    "
+                if (sys.version_info.major == 3 and sys.version_info.minor < 13)
+                else ""
+            )
+            parameters_doc_tail = f"\n{tab}Attributes"
+            n_jobs_doc = f"""
+{tab}n_jobs : int, default=None
+{tab}    The number of jobs to use in parallel for the computation.
+{tab}    ``None`` means using all physical cores
+{tab}    unless in a :obj:`joblib.parallel_backend` context.
+{tab}    ``-1`` means using all logical cores.
+{tab}    See :term:`Glossary <n_jobs>` for more details.
 """
             original_class.__doc__ = original_class.__doc__.replace(
                 parameters_doc_tail, n_jobs_doc + parameters_doc_tail

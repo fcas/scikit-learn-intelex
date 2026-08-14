@@ -14,32 +14,61 @@
 # limitations under the License.
 # ==============================================================================
 
+# ==============================================================================
+# BSD 3-Clause License
+#
+# Copyright (c) 2007-2026 The scikit-learn developers.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# * Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+#
+# * Neither the name of the copyright holder nor the names of its
+#   contributors may be used to endorse or promote products derived from
+#   this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# ==============================================================================
+
 import logging
 from collections.abc import Sequence
 from functools import partial
 
 import numpy as np
 from scipy import sparse as sp
+from sklearn.metrics import roc_auc_score as _sklearn_roc_auc_score
 from sklearn.metrics._base import _average_binary_score
 from sklearn.metrics._ranking import _binary_roc_auc_score
 from sklearn.metrics._ranking import _multiclass_roc_auc_score as multiclass_roc_auc_score
 from sklearn.preprocessing import label_binarize
 from sklearn.utils import check_array
+from sklearn.utils._param_validation import validate_params
 from sklearn.utils.multiclass import is_multilabel
 
 import daal4py as d4p
 
-from .._device_offload import support_usm_ndarray
-from .._utils import PatchingConditionsChain, get_patch_message, sklearn_check_version
+from .._utils import (
+    PatchingConditionsChain,
+    check_is_array_api,
+    get_patch_message,
+)
 from ..utils.validation import _assert_all_finite
-
-if sklearn_check_version("1.3"):
-    from sklearn.utils._param_validation import (
-        Interval,
-        Real,
-        StrOptions,
-        validate_params,
-    )
 
 try:
     import pandas as pd
@@ -119,7 +148,6 @@ def _daal_type_of_target(y):
     return result
 
 
-@support_usm_ndarray(freefunc=True)
 def roc_auc_score(
     y_true,
     y_score,
@@ -130,11 +158,38 @@ def roc_auc_score(
     multi_class="raise",
     labels=None,
 ):
+    _patching_status = PatchingConditionsChain("sklearn.metrics.roc_auc_score")
+    _dal_ready = _patching_status.and_conditions(
+        [
+            (sample_weight is None, "Sample weights are not supported"),
+            (max_fpr is None, "'max_fpr' is not supported"),
+            (
+                not (
+                    check_is_array_api(y_true)
+                    or check_is_array_api(y_score)
+                    or check_is_array_api(sample_weight)
+                    or check_is_array_api(labels)
+                ),
+                "Array API inputs other than NumPy are not supported.",
+            ),
+        ]
+    )
+    if not _dal_ready:
+        _patching_status.write_log()
+        return _sklearn_roc_auc_score(
+            y_true,
+            y_score,
+            average=average,
+            sample_weight=sample_weight,
+            max_fpr=max_fpr,
+            multi_class=multi_class,
+            labels=labels,
+        )
+
     y_type = _daal_type_of_target(y_true)
     y_true = check_array(y_true, ensure_2d=False, dtype=None)
     y_score = check_array(y_score, ensure_2d=False)
 
-    _patching_status = PatchingConditionsChain("sklearn.metrics.roc_auc_score")
     _dal_ready = _patching_status.and_conditions(
         [
             (
@@ -144,8 +199,26 @@ def roc_auc_score(
             )
         ]
     )
-
     _patching_status.write_log()
+    if not _dal_ready:
+        return _sklearn_roc_auc_score(
+            y_true,
+            y_score,
+            average=average,
+            sample_weight=sample_weight,
+            max_fpr=max_fpr,
+            multi_class=multi_class,
+            labels=labels,
+        )
+
+    # Comment 2026-03-03: the original code here was a copy-paste from an older scikit-learn
+    # version with some parts replaced with calls to oneDAL. The logic was then modified to
+    # fall back to scikit-learn's 'roc_auc_score' directly and as early as possible, so some
+    # code branches below this comment might be unreachable. Note that the logic of not falling
+    # back has the advantage of avoiding two calls to 'check_array', but after some input
+    # has already been processed by it, passing it again to that function shouldn't do any
+    # data conversions.
+
     if y_type[0] == "multiclass" or (
         y_type[0] == "binary" and y_score.ndim == 2 and y_score.shape[1] > 2
     ):
@@ -197,16 +270,7 @@ def roc_auc_score(
     )
 
 
-if sklearn_check_version("1.3"):
-    roc_auc_score = validate_params(
-        {
-            "y_true": ["array-like"],
-            "y_score": ["array-like"],
-            "average": [StrOptions({"micro", "macro", "samples", "weighted"}), None],
-            "sample_weight": ["array-like", None],
-            "max_fpr": [Interval(Real, 0.0, 1, closed="right"), None],
-            "multi_class": [StrOptions({"raise", "ovr", "ovo"})],
-            "labels": ["array-like", None],
-        },
-        prefer_skip_nested_validation=True,
-    )(roc_auc_score)
+roc_auc_score = validate_params(
+    _sklearn_roc_auc_score._skl_parameter_constraints,
+    prefer_skip_nested_validation=True,
+)(roc_auc_score)

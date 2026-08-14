@@ -17,14 +17,15 @@
 import numpy as np
 from sklearn.utils import check_random_state
 
-from daal4py.sklearn._utils import daal_check_version, get_dtype
+from .. import _default_backend, onedal_check_version
+from .._device_offload import supports_queue
+from ..common._backend import bind_default_backend
+from ..datatypes import from_table, to_table
+from ..utils import _sycl_queue_manager as QM
 
-from ..common._base import BaseEstimator as onedal_BaseEstimator
-from ..datatypes import _convert_to_supported, from_table, to_table
+if onedal_check_version(2023, 2, 0):
 
-if daal_check_version((2023, "P", 200)):
-
-    class KMeansInit(onedal_BaseEstimator):
+    class KMeansInit:
         """
         KMeansInit oneDAL implementation.
         """
@@ -35,60 +36,56 @@ if daal_check_version((2023, "P", 200)):
             seed=777,
             local_trials_count=None,
             algorithm="plus_plus_dense",
+            is_csr=False,
         ):
             self.cluster_count = cluster_count
             self.seed = seed
             self.local_trials_count = local_trials_count
             self.algorithm = algorithm
+            self.is_csr = is_csr
 
             if local_trials_count is None:
                 self.local_trials_count = 2 + int(np.log(cluster_count))
             else:
                 self.local_trials_count = local_trials_count
 
+        # force use of `no_policy` as it must be directly managed for csr data
+        @bind_default_backend("kmeans_init.init", lookup_name="compute", no_policy=True)
+        def _backend_compute(self, policy, params, X_table): ...
+
+        # it checks for csr data and forces computation on host
+        def backend_compute(self, params, X_table):
+            policy = _default_backend.get_policy(
+                None if self.is_csr else QM.get_global_queue()
+            )
+            return self._backend_compute(policy, params, X_table)
+
         def _get_onedal_params(self, dtype=np.float32):
             return {
-                "fptype": "float" if dtype == np.float32 else "double",
+                "fptype": dtype,
                 "local_trials_count": self.local_trials_count,
                 "method": self.algorithm,
                 "seed": self.seed,
                 "cluster_count": self.cluster_count,
             }
 
-        def _get_params_and_input(self, X, policy):
-            X_loc = np.asarray(X)
-            types = [np.float32, np.float64]
-            if get_dtype(X_loc) not in types:
-                X_loc = X_loc.astype(np.float64)
-
-            X_loc = _convert_to_supported(policy, X_loc)
-
-            dtype = get_dtype(X_loc)
+        def _compute_raw(self, X_table, dtype=np.float32, queue=None):
             params = self._get_onedal_params(dtype)
-            return (params, to_table(X_loc), dtype)
-
-        def _compute_raw(self, X_table, module, policy, dtype=np.float32):
-            params = self._get_onedal_params(dtype)
-
-            result = module.compute(policy, params, X_table)
-
+            result = self.backend_compute(params, X_table)
             return result.centroids
 
-        def _compute(self, X, module, queue):
-            policy = self._get_policy(queue, X)
-            _, X_table, dtype = self._get_params_and_input(X, policy)
-
-            centroids = self._compute_raw(X_table, module, policy, dtype)
-
+        def _compute(self, X):
+            X_table = to_table(X, queue=QM.get_global_queue())
+            centroids = self._compute_raw(X_table, X_table.dtype)
             return from_table(centroids)
 
-        def compute_raw(self, X_table, policy, dtype=np.float32):
-            return self._compute_raw(
-                X_table, self._get_backend("kmeans_init", "init", None), policy, dtype
-            )
+        def compute_raw(self, X_table, dtype=np.float32, queue=None):
+            # no @supports_queue decorator here, because we only accept X_table that has no queue information
+            return self._compute_raw(X_table, dtype, queue)
 
+        @supports_queue
         def compute(self, X, queue=None):
-            return self._compute(X, self._get_backend("kmeans_init", "init", None), queue)
+            return self._compute(X)
 
     def kmeans_plusplus(
         X,
@@ -103,6 +100,6 @@ if daal_check_version((2023, "P", 200)):
         return (
             KMeansInit(
                 n_clusters, seed=random_seed, local_trials_count=n_local_trials
-            ).compute(X, queue),
+            ).compute(X, queue=queue),
             np.full(n_clusters, -1),
         )

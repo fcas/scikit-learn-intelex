@@ -15,10 +15,11 @@
 # ==============================================================================
 
 import dpctl
-import dpctl.tensor as dpt
+import dpnp
 import numpy as np
 from mpi4py import MPI
 
+from sklearnex import config_context
 from sklearnex.spmd.decomposition import PCA
 
 
@@ -35,9 +36,12 @@ rank = comm.Get_rank()
 size = comm.Get_size()
 
 X = get_data(rank)
-dpt_X = dpt.asarray(X, usm_type="device", sycl_queue=q)
+dpnp_X = dpnp.asarray(X, usm_type="device", sycl_queue=q)
 
-pca = PCA(n_components=2).fit(dpt_X)
+# Array API dispatch keeps dpnp data on device throughout the computation.
+# The SCIPY_ARRAY_API environment variable must also be set to enable this.
+with config_context(array_api_dispatch=True):
+    pca = PCA(n_components=2).fit(dpnp_X)
 
-print(f"Singular values on rank {rank}:\n", pca.singular_values_)
-print(f"Explained variance Ratio on rank {rank}:\n", pca.explained_variance_ratio_)
+    print(f"Singular values on rank {rank}:\n", pca.singular_values_)
+    print(f"Explained variance Ratio on rank {rank}:\n", pca.explained_variance_ratio_)

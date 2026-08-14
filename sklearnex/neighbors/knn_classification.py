@@ -16,106 +16,100 @@
 
 from sklearn.metrics import accuracy_score
 from sklearn.neighbors._classification import (
-    KNeighborsClassifier as sklearn_KNeighborsClassifier,
+    KNeighborsClassifier as _sklearn_KNeighborsClassifier,
 )
-from sklearn.neighbors._unsupervised import NearestNeighbors as sklearn_NearestNeighbors
-from sklearn.utils.validation import _deprecate_positional_args, check_is_fitted
+from sklearn.utils._array_api import get_namespace
+from sklearn.utils.multiclass import check_classification_targets
+from sklearn.utils.validation import check_is_fitted
 
 from daal4py.sklearn._n_jobs_support import control_n_jobs
 from daal4py.sklearn._utils import sklearn_check_version
+from daal4py.sklearn.utils.validation import get_requires_y_tag
+from onedal.datatypes import from_table
 from onedal.neighbors import KNeighborsClassifier as onedal_KNeighborsClassifier
+from onedal.utils._array_api import _is_numpy_namespace
 
 from .._device_offload import dispatch, wrap_output_data
+from ..utils._array_api import enable_array_api
+from ..utils.validation import validate_data
 from .common import KNeighborsDispatchingBase
 
+if sklearn_check_version("1.9"):
+    from sklearn.utils._array_api import (
+        check_same_namespace,
+        get_namespace_and_device,
+        move_to,
+    )
 
+
+@enable_array_api
 @control_n_jobs(
     decorated_methods=["fit", "predict", "predict_proba", "kneighbors", "score"]
 )
-class KNeighborsClassifier(sklearn_KNeighborsClassifier, KNeighborsDispatchingBase):
-    __doc__ = sklearn_KNeighborsClassifier.__doc__
-    if sklearn_check_version("1.2"):
-        _parameter_constraints: dict = {
-            **sklearn_KNeighborsClassifier._parameter_constraints
-        }
+class KNeighborsClassifier(KNeighborsDispatchingBase, _sklearn_KNeighborsClassifier):
+    __doc__ = _sklearn_KNeighborsClassifier.__doc__
+    # Default onedal estimator class - SPMD subclasses can override this
+    _onedal_estimator = onedal_KNeighborsClassifier
 
-    if sklearn_check_version("1.0"):
+    _parameter_constraints: dict = {
+        **_sklearn_KNeighborsClassifier._parameter_constraints
+    }
 
-        def __init__(
-            self,
-            n_neighbors=5,
-            *,
-            weights="uniform",
-            algorithm="auto",
-            leaf_size=30,
-            p=2,
-            metric="minkowski",
-            metric_params=None,
-            n_jobs=None,
-        ):
-            super().__init__(
-                n_neighbors=n_neighbors,
-                weights=weights,
-                algorithm=algorithm,
-                leaf_size=leaf_size,
-                metric=metric,
-                p=p,
-                metric_params=metric_params,
-                n_jobs=n_jobs,
-            )
-
-    else:
-
-        @_deprecate_positional_args
-        def __init__(
-            self,
-            n_neighbors=5,
-            *,
-            weights="uniform",
-            algorithm="auto",
-            leaf_size=30,
-            p=2,
-            metric="minkowski",
-            metric_params=None,
-            n_jobs=None,
-            **kwargs,
-        ):
-            super().__init__(
-                n_neighbors=n_neighbors,
-                weights=weights,
-                algorithm=algorithm,
-                leaf_size=leaf_size,
-                metric=metric,
-                p=p,
-                metric_params=metric_params,
-                n_jobs=n_jobs,
-                **kwargs,
-            )
+    def __init__(
+        self,
+        n_neighbors=5,
+        *,
+        weights="uniform",
+        algorithm="auto",
+        leaf_size=30,
+        p=2,
+        metric="minkowski",
+        metric_params=None,
+        n_jobs=None,
+    ):
+        super().__init__(
+            n_neighbors=n_neighbors,
+            weights=weights,
+            algorithm=algorithm,
+            leaf_size=leaf_size,
+            metric=metric,
+            p=p,
+            metric_params=metric_params,
+            n_jobs=n_jobs,
+        )
 
     def fit(self, X, y):
+        if sklearn_check_version("1.9"):
+            xp, is_array_api, device = get_namespace_and_device(X)
+        else:
+            xp, is_array_api = get_namespace(X)
+            device = getattr(X, "device", None)
+
         dispatch(
             self,
             "fit",
             {
                 "onedal": self.__class__._onedal_fit,
-                "sklearn": sklearn_KNeighborsClassifier.fit,
+                "sklearn": _sklearn_KNeighborsClassifier.fit,
             },
             X,
             y,
         )
+        # Ensure _fit_X matches the input namespace so that
+        # kneighbors(X=None) can use get_namespace(self._fit_X).
+        if is_array_api and not _is_numpy_namespace(xp):
+            self._fit_X = xp.asarray(self._fit_X, device=device)
         return self
 
     @wrap_output_data
     def predict(self, X):
         check_is_fitted(self)
-        if sklearn_check_version("1.0"):
-            self._check_feature_names(X, reset=False)
         return dispatch(
             self,
             "predict",
             {
                 "onedal": self.__class__._onedal_predict,
-                "sklearn": sklearn_KNeighborsClassifier.predict,
+                "sklearn": _sklearn_KNeighborsClassifier.predict,
             },
             X,
         )
@@ -123,14 +117,12 @@ class KNeighborsClassifier(sklearn_KNeighborsClassifier, KNeighborsDispatchingBa
     @wrap_output_data
     def predict_proba(self, X):
         check_is_fitted(self)
-        if sklearn_check_version("1.0"):
-            self._check_feature_names(X, reset=False)
         return dispatch(
             self,
             "predict_proba",
             {
                 "onedal": self.__class__._onedal_predict_proba,
-                "sklearn": sklearn_KNeighborsClassifier.predict_proba,
+                "sklearn": _sklearn_KNeighborsClassifier.predict_proba,
             },
             X,
         )
@@ -138,14 +130,13 @@ class KNeighborsClassifier(sklearn_KNeighborsClassifier, KNeighborsDispatchingBa
     @wrap_output_data
     def score(self, X, y, sample_weight=None):
         check_is_fitted(self)
-        if sklearn_check_version("1.0"):
-            self._check_feature_names(X, reset=False)
+
         return dispatch(
             self,
             "score",
             {
                 "onedal": self.__class__._onedal_score,
-                "sklearn": sklearn_KNeighborsClassifier.score,
+                "sklearn": _sklearn_KNeighborsClassifier.score,
             },
             X,
             y,
@@ -154,77 +145,219 @@ class KNeighborsClassifier(sklearn_KNeighborsClassifier, KNeighborsDispatchingBa
 
     @wrap_output_data
     def kneighbors(self, X=None, n_neighbors=None, return_distance=True):
+        # Validate n_neighbors parameter first
+        if n_neighbors is not None:
+            self._validate_n_neighbors(n_neighbors)
+
         check_is_fitted(self)
-        if sklearn_check_version("1.0") and X is not None:
-            self._check_feature_names(X, reset=False)
+
+        # Validate kneighbors parameters (inherited from KNeighborsDispatchingBase)
+        self._kneighbors_validation(X, n_neighbors)
+
         return dispatch(
             self,
             "kneighbors",
             {
                 "onedal": self.__class__._onedal_kneighbors,
-                "sklearn": sklearn_KNeighborsClassifier.kneighbors,
+                "sklearn": _sklearn_KNeighborsClassifier.kneighbors,
             },
             X,
             n_neighbors=n_neighbors,
             return_distance=return_distance,
         )
 
-    @wrap_output_data
-    def radius_neighbors(
-        self, X=None, radius=None, return_distance=True, sort_results=False
-    ):
-        _onedal_estimator = getattr(self, "_onedal_estimator", None)
+    def _onedal_fit(self, X, y, queue=None):
+        xp, _ = get_namespace(X)
+        self._set_effective_metric()
 
-        if (
-            _onedal_estimator is not None
-            or getattr(self, "_tree", 0) is None
-            and self._fit_method == "kd_tree"
-        ):
-            sklearn_NearestNeighbors.fit(self, self._fit_X, getattr(self, "_y", None))
-        result = sklearn_NearestNeighbors.radius_neighbors(
-            self, X, radius, return_distance, sort_results
+        X, y = validate_data(
+            self,
+            X,
+            y,
+            dtype=[xp.float64, xp.float32],
+            accept_sparse="csr",
+            multi_output=True,
         )
 
-        return result
+        # Process classification targets before passing to onedal
+        self._process_classification_targets(X, y, skip_validation=False)
 
-    def _onedal_fit(self, X, y, queue=None):
+        # Call onedal backend
         onedal_params = {
             "n_neighbors": self.n_neighbors,
             "weights": self.weights,
             "algorithm": self.algorithm,
             "metric": self.effective_metric_,
-            "p": self.effective_metric_params_["p"],
+            "p": self.effective_metric_params_.get("p", 2),
         }
 
-        try:
-            requires_y = self._get_tags()["requires_y"]
-        except KeyError:
-            requires_y = False
-
-        self._onedal_estimator = onedal_KNeighborsClassifier(**onedal_params)
-        self._onedal_estimator.requires_y = requires_y
+        # Use class-level _onedal_estimator if available (for SPMD), else use module-level
+        if hasattr(self.__class__, "_onedal_estimator"):
+            self._onedal_estimator = self.__class__._onedal_estimator(**onedal_params)
+        else:
+            self._onedal_estimator = onedal_KNeighborsClassifier(**onedal_params)
+        self._onedal_estimator.requires_y = get_requires_y_tag(self)
         self._onedal_estimator.effective_metric_ = self.effective_metric_
         self._onedal_estimator.effective_metric_params_ = self.effective_metric_params_
-        self._onedal_estimator.fit(X, y, queue=queue)
+        self._onedal_estimator.classes_ = self.classes_
+        self._onedal_estimator._y = self._y
+        self._onedal_estimator.outputs_2d_ = self.outputs_2d_
+        self._onedal_estimator._shape = self._shape
 
+        # Reshape encoded labels for C++ backend (always needs (-1, 1) shape)
+        fit_y = xp.reshape(self._y, (-1, 1))
+        self._onedal_estimator.fit(X, fit_y, queue=queue)
+
+        # Post-processing
         self._save_attributes()
 
+    def _process_classification_targets(self, X, y, skip_validation=False):
+        """Process classification targets and set class-related attributes.
+
+        Parameters
+        ----------
+        y : array-like
+            Target values
+        skip_validation : bool, default=False
+            If True, skip check_classification_targets validation.
+        """
+        # Array API support: get namespace from y
+        xp, _ = get_namespace(y)
+
+        y = xp.asarray(y)
+        self._shape = y.shape
+
+        if y.ndim == 1 or y.ndim == 2 and y.shape[1] == 1:
+            self.outputs_2d_ = False
+            y = xp.reshape(y, (-1, 1))
+        else:
+            self.outputs_2d_ = True
+
+        # Validate classification targets.
+        # Only validate numpy arrays since _check_classification_targets
+        # uses np.asarray internally, which fails for device arrays
+        # (dpnp, torch XPU, etc.).
+        if not skip_validation and _is_numpy_namespace(xp):
+            check_classification_targets(y)
+
+        # Process classes using unique_inverse (numpy 2.0+ and Array API)
+        # or unique with return_inverse (older numpy)
+        n_outputs = y.shape[1]
+        self.classes_ = [None] * n_outputs
+        self._y = xp.empty_like(y, dtype=xp.int64)
+        for k in range(n_outputs):
+            if hasattr(xp, "unique_inverse"):
+                classes_k, inverse_k = xp.unique_inverse(y[:, k])
+            else:
+                classes_k, inverse_k = xp.unique(y[:, k], return_inverse=True)
+            self.classes_[k] = classes_k
+            self._y[:, k] = xp.asarray(inverse_k, dtype=xp.int64)
+
+        if not self.outputs_2d_:
+            self.classes_ = self.classes_[0]
+            self._y = xp.reshape(self._y, (-1,))
+
+        if sklearn_check_version("1.9"):
+            xp_X, _, device = get_namespace_and_device(X)
+            self._y = move_to(self._y, xp=xp_X, device=device)
+
     def _onedal_predict(self, X, queue=None):
-        return self._onedal_estimator.predict(X, queue=queue)
+        if X is not None:
+            xp, _ = get_namespace(X)
+            X = validate_data(
+                self,
+                X,
+                dtype=[xp.float64, xp.float32],
+                accept_sparse="csr",
+                reset=False,
+            )
+            if sklearn_check_version("1.9"):
+                check_same_namespace(X, self, attribute="_fit_X", method="predict")
+
+        params = self._onedal_estimator._get_onedal_params(X)
+        params["result_option"] = "responses"
+        result = self._onedal_estimator._onedal_predict(
+            self._onedal_estimator._onedal_model, X, params
+        )
+        responses = from_table(result.responses, like=X)
+        if sklearn_check_version("1.9"):
+            xp, _, device = get_namespace_and_device(self.classes_)
+            responses = move_to(responses, xp=xp, device=device)
+        else:
+            xp, _ = get_namespace(X)
+        return xp.take(
+            self.classes_, xp.asarray(xp.reshape(responses, (-1,)), dtype=xp.int64)
+        )
 
     def _onedal_predict_proba(self, X, queue=None):
-        return self._onedal_estimator.predict_proba(X, queue=queue)
+        if X is not None:
+            xp, _ = get_namespace(X)
+            X = validate_data(
+                self,
+                X,
+                dtype=[xp.float64, xp.float32],
+                accept_sparse="csr",
+                reset=False,
+            )
+            if sklearn_check_version("1.9"):
+                check_same_namespace(X, self, attribute="_fit_X", method="predict_proba")
+
+        neigh_dist, neigh_ind = self._onedal_estimator.kneighbors(X)
+
+        return self._compute_class_probabilities(
+            neigh_dist, neigh_ind, self.weights, self._y, self.classes_, self.outputs_2d_
+        )
 
     def _onedal_kneighbors(
         self, X=None, n_neighbors=None, return_distance=True, queue=None
     ):
-        return self._onedal_estimator.kneighbors(
-            X, n_neighbors, return_distance, queue=queue
+        # Determine if query is the training data
+        if X is not None:
+            query_is_train = False
+            xp, _ = get_namespace(X)
+            X = validate_data(
+                self,
+                X,
+                dtype=[xp.float64, xp.float32],
+                accept_sparse="csr",
+                reset=False,
+            )
+            if sklearn_check_version("1.9"):
+                check_same_namespace(X, self, attribute="_fit_X", method="kneighbors")
+        else:
+            query_is_train = True
+            X = self._fit_X
+
+        # Resolve effective n_neighbors (adjust for self-exclusion)
+        effective_n_neighbors = (
+            n_neighbors if n_neighbors is not None else self.n_neighbors
+        )
+        if query_is_train:
+            effective_n_neighbors += 1
+
+        # Validate bounds with adjusted n_neighbors
+        self._validate_kneighbors_bounds(effective_n_neighbors, query_is_train, X)
+
+        # Always get both distances and indices for post-processing
+        # Pass n_neighbors as keyword to avoid _transfer_to_host mixing
+        # USM array X with int n_neighbors in the same positional args tuple
+        distances, indices = self._onedal_estimator.kneighbors(
+            X, n_neighbors=effective_n_neighbors, return_distance=True, queue=queue
+        )
+
+        return self._kneighbors_postprocess(
+            distances,
+            indices,
+            n_neighbors if n_neighbors is not None else self.n_neighbors,
+            return_distance,
+            query_is_train,
         )
 
     def _onedal_score(self, X, y, sample_weight=None, queue=None):
         return accuracy_score(
-            y, self._onedal_predict(X, queue=queue), sample_weight=sample_weight
+            y,
+            self._onedal_predict(X, queue=queue),
+            sample_weight=sample_weight,
         )
 
     def _save_attributes(self):
@@ -237,9 +370,8 @@ class KNeighborsClassifier(sklearn_KNeighborsClassifier, KNeighborsDispatchingBa
         self.outputs_2d_ = self._onedal_estimator.outputs_2d_
         self._tree = self._onedal_estimator._tree
 
-    fit.__doc__ = sklearn_KNeighborsClassifier.fit.__doc__
-    predict.__doc__ = sklearn_KNeighborsClassifier.predict.__doc__
-    predict_proba.__doc__ = sklearn_KNeighborsClassifier.predict_proba.__doc__
-    score.__doc__ = sklearn_KNeighborsClassifier.score.__doc__
-    kneighbors.__doc__ = sklearn_KNeighborsClassifier.kneighbors.__doc__
-    radius_neighbors.__doc__ = sklearn_NearestNeighbors.radius_neighbors.__doc__
+    fit.__doc__ = _sklearn_KNeighborsClassifier.fit.__doc__
+    predict.__doc__ = _sklearn_KNeighborsClassifier.predict.__doc__
+    predict_proba.__doc__ = _sklearn_KNeighborsClassifier.predict_proba.__doc__
+    score.__doc__ = _sklearn_KNeighborsClassifier.score.__doc__
+    kneighbors.__doc__ = _sklearn_KNeighborsClassifier.kneighbors.__doc__

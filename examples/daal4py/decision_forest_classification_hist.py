@@ -49,7 +49,7 @@ def main(readcsv=pd_read_csv, method="hist"):
     data = readcsv(infile, usecols=range(3), dtype=np.float32)
     labels = readcsv(infile, usecols=range(3, 4), dtype=np.float32)
     train_result = train_algo.compute(data, labels)
-    # Traiing result provides (depending on parameters) model,
+    # Training result provides (depending on parameters) model,
     # outOfBagError, outOfBagErrorPerObservation and/or variableImportance
 
     # Now let's do some prediction
@@ -71,7 +71,7 @@ def main(readcsv=pd_read_csv, method="hist"):
 
 
 if __name__ == "__main__":
-    (train_result, predict_result, plabels) = main()
+    train_result, predict_result, plabels = main()
     print("\nVariable importance results:\n", train_result.variableImportance)
     print("\nOOB error:\n", train_result.outOfBagError)
     print(

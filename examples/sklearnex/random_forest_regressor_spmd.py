@@ -19,12 +19,12 @@
 #    mpirun -n 4 python ./random_forest_regressor_spmd.py
 
 import dpctl
-import dpctl.tensor as dpt
 import dpnp
 import numpy as np
 from mpi4py import MPI
 from numpy.testing import assert_allclose
 
+from sklearnex import config_context
 from sklearnex.spmd.ensemble import RandomForestRegressor
 
 
@@ -53,24 +53,27 @@ X_test, y_test, coef_test = generate_X_y(params_test, 10, mpi_rank + 99)
 
 assert_allclose(coef_train, coef_test)
 
-# Both `dpnp.ndarrays` and `dpctl.tensors` can be used in the same flow
-# for invoking GPU offloading. Just make sure that, they are using
-# the same sycl context.
+q = dpctl.SyclQueue("gpu")
 
-q = dpctl.SyclQueue("gpu")  # GPU
-
-dpt_X_train = dpt.asarray(X_train, usm_type="device", sycl_queue=q)
-dpt_y_train = dpt.asarray(y_train, usm_type="device", sycl_queue=q)
+dpnp_X_train = dpnp.asarray(X_train, usm_type="device", sycl_queue=q)
+dpnp_y_train = dpnp.asarray(y_train, usm_type="device", sycl_queue=q)
 
 dpnp_X_test = dpnp.asarray(X_test, usm_type="device", sycl_queue=q)
 
-rf = RandomForestRegressor(max_depth=2, random_state=0).fit(dpt_X_train, dpt_y_train)
-
-y_predict = rf.predict(dpnp_X_test)
-
-print("Ground truth (first 5 observations on rank {}):\n{}".format(mpi_rank, y_test[:5]))
-print(
-    "Regression results (first 5 observations on rank {}):\n{}".format(
-        mpi_rank, y_predict[:5]
+# Array API dispatch keeps dpnp data on device throughout the computation.
+# The SCIPY_ARRAY_API environment variable must also be set to enable this.
+with config_context(array_api_dispatch=True):
+    rf = RandomForestRegressor(max_depth=2, random_state=0).fit(
+        dpnp_X_train, dpnp_y_train
     )
-)
+
+    y_predict = rf.predict(dpnp_X_test)
+
+    print(
+        "Ground truth (first 5 observations on rank {}):\n{}".format(mpi_rank, y_test[:5])
+    )
+    print(
+        "Regression results (first 5 observations on rank {}):\n{}".format(
+            mpi_rank, y_predict[:5]
+        )
+    )

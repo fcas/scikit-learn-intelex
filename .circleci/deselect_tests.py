@@ -19,19 +19,18 @@
 import argparse
 import os.path
 import sys
+import warnings
 
-from yaml import FullLoader
-from yaml import load as yaml_load
+import sklearn
 
 try:
     from packaging.version import Version
 except ImportError:
     from distutils.version import LooseVersion as Version
 
-import warnings
-
-import sklearn
 from sklearn import __version__ as sklearn_version
+from yaml import FullLoader
+from yaml import load as yaml_load
 
 
 def evaluate_cond(cond, v):
@@ -82,13 +81,10 @@ def create_pytest_switches(
         with open(filename, "r") as fh:
             dt = yaml_load(fh, Loader=FullLoader)
 
+        sklearn_dir = os.path.dirname(sklearn.__file__)
+
         if absolute:
-            base_dir = (
-                os.path.relpath(
-                    os.path.dirname(sklearn.__file__), os.path.expanduser("~")
-                )
-                + "/"
-            )
+            base_dir = os.path.relpath(sklearn_dir, os.path.expanduser("~")) + "/"
         elif base_dir is None:
             base_dir = ""
         elif not base_dir.endswith("/"):
@@ -129,7 +125,15 @@ def create_pytest_switches(
         pytest_switches = []
         for test_name in filtered_deselection:
             if test_name:
-                pytest_switches.extend(["--deselect", base_dir + test_name])
+                pytest_switches.extend(["--deselect=" + base_dir + test_name])
+
+        # Files that crash at collection time need --ignore instead of --deselect
+        for entry in dt.get("ignored_tests", []):
+            rel_path = filter_by_version_and_platform(entry, sklearn_version)
+            if rel_path:
+                pytest_switches.append(
+                    "--ignore=" + os.path.join(sklearn_dir, *rel_path.split("/"))
+                )
     return pytest_switches
 
 

@@ -14,20 +14,18 @@
 # limitations under the License.
 # ===============================================================================
 
+import array_api_strict
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 
-from onedal.basic_statistics.tests.test_incremental_basic_statistics import (
-    expected_max,
-    expected_mean,
-    expected_sum,
-    options_and_tests,
-)
+from daal4py.sklearn._utils import _package_check_version, sklearn_check_version
+from onedal.basic_statistics.tests.utils import options_and_tests
 from onedal.tests.utils._dataframes_support import (
     _convert_to_dataframe,
     get_dataframes_and_queues,
 )
+from onedal.tests.utils._device_selection import is_sycl_device_available
 from sklearnex.basic_statistics import IncrementalBasicStatistics
 
 
@@ -60,29 +58,29 @@ def test_partial_fit_multiple_options_on_gold_data(dataframe, queue, weighted, d
         expected_weighted_mean = np.array([0.25, 0.25])
         expected_weighted_min = np.array([0, 0])
         expected_weighted_max = np.array([0.5, 0.5])
-        assert_allclose(expected_weighted_mean, result.mean)
-        assert_allclose(expected_weighted_max, result.max)
-        assert_allclose(expected_weighted_min, result.min)
+        assert_allclose(expected_weighted_mean, result.mean_)
+        assert_allclose(expected_weighted_max, result.max_)
+        assert_allclose(expected_weighted_min, result.min_)
     else:
         expected_mean = np.array([0.5, 0.5])
         expected_min = np.array([0, 0])
         expected_max = np.array([1, 1])
-        assert_allclose(expected_mean, result.mean)
-        assert_allclose(expected_max, result.max)
-        assert_allclose(expected_min, result.min)
+        assert_allclose(expected_mean, result.mean_)
+        assert_allclose(expected_max, result.max_)
+        assert_allclose(expected_min, result.min_)
 
 
 @pytest.mark.parametrize("dataframe,queue", get_dataframes_and_queues())
 @pytest.mark.parametrize("num_batches", [2, 10])
-@pytest.mark.parametrize("option", options_and_tests)
+@pytest.mark.parametrize("result_option", options_and_tests.keys())
 @pytest.mark.parametrize("row_count", [100, 1000])
 @pytest.mark.parametrize("column_count", [10, 100])
 @pytest.mark.parametrize("weighted", [True, False])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_partial_fit_single_option_on_random_data(
-    dataframe, queue, num_batches, option, row_count, column_count, weighted, dtype
+    dataframe, queue, num_batches, result_option, row_count, column_count, weighted, dtype
 ):
-    result_option, function, tols = option
+    function, tols = options_and_tests[result_option]
     fp32tol, fp64tol = tols
     seed = 77
     gen = np.random.default_rng(seed)
@@ -107,7 +105,7 @@ def test_partial_fit_single_option_on_random_data(
         else:
             result = incbs.partial_fit(X_split_df)
 
-    res = getattr(result, result_option)
+    res = getattr(result, result_option + "_")
     if weighted:
         weighted_data = np.diag(weights) @ X
         gtr = function(weighted_data)
@@ -150,19 +148,19 @@ def test_partial_fit_multiple_options_on_random_data(
         else:
             result = incbs.partial_fit(X_split_df)
 
-    res_mean, res_max, res_sum = result.mean, result.max, result.sum
+    res_mean, res_max, res_sum = result.mean_, result.max_, result.sum_
     if weighted:
         weighted_data = np.diag(weights) @ X
         gtr_mean, gtr_max, gtr_sum = (
-            expected_mean(weighted_data),
-            expected_max(weighted_data),
-            expected_sum(weighted_data),
+            options_and_tests["mean"][0](weighted_data),
+            options_and_tests["max"][0](weighted_data),
+            options_and_tests["sum"][0](weighted_data),
         )
     else:
         gtr_mean, gtr_max, gtr_sum = (
-            expected_mean(X),
-            expected_max(X),
-            expected_sum(X),
+            options_and_tests["mean"][0](X),
+            options_and_tests["max"][0](X),
+            options_and_tests["sum"][0](X),
         )
 
     tol = 3e-4 if res_mean.dtype == np.float32 else 1e-7
@@ -206,10 +204,10 @@ def test_partial_fit_all_option_on_random_data(
     if weighted:
         weighted_data = np.diag(weights) @ X
 
-    for option in options_and_tests:
-        result_option, function, tols = option
+    for result_option in options_and_tests:
+        function, tols = options_and_tests[result_option]
         fp32tol, fp64tol = tols
-        res = getattr(result, result_option)
+        res = getattr(result, result_option + "_")
         if weighted:
             gtr = function(weighted_data)
         else:
@@ -240,29 +238,29 @@ def test_fit_multiple_options_on_gold_data(dataframe, queue, weighted, dtype):
         expected_weighted_mean = np.array([0.25, 0.25])
         expected_weighted_min = np.array([0, 0])
         expected_weighted_max = np.array([0.5, 0.5])
-        assert_allclose(expected_weighted_mean, result.mean)
-        assert_allclose(expected_weighted_max, result.max)
-        assert_allclose(expected_weighted_min, result.min)
+        assert_allclose(expected_weighted_mean, result.mean_)
+        assert_allclose(expected_weighted_max, result.max_)
+        assert_allclose(expected_weighted_min, result.min_)
     else:
         expected_mean = np.array([0.5, 0.5])
         expected_min = np.array([0, 0])
         expected_max = np.array([1, 1])
-        assert_allclose(expected_mean, result.mean)
-        assert_allclose(expected_max, result.max)
-        assert_allclose(expected_min, result.min)
+        assert_allclose(expected_mean, result.mean_)
+        assert_allclose(expected_max, result.max_)
+        assert_allclose(expected_min, result.min_)
 
 
 @pytest.mark.parametrize("dataframe,queue", get_dataframes_and_queues())
 @pytest.mark.parametrize("num_batches", [2, 10])
-@pytest.mark.parametrize("option", options_and_tests)
+@pytest.mark.parametrize("result_option", options_and_tests.keys())
 @pytest.mark.parametrize("row_count", [100, 1000])
 @pytest.mark.parametrize("column_count", [10, 100])
 @pytest.mark.parametrize("weighted", [True, False])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_fit_single_option_on_random_data(
-    dataframe, queue, num_batches, option, row_count, column_count, weighted, dtype
+    dataframe, queue, num_batches, result_option, row_count, column_count, weighted, dtype
 ):
-    result_option, function, tols = option
+    function, tols = options_and_tests[result_option]
     fp32tol, fp64tol = tols
     seed = 77
     gen = np.random.default_rng(seed)
@@ -283,7 +281,7 @@ def test_fit_single_option_on_random_data(
     else:
         result = incbs.fit(X_df)
 
-    res = getattr(result, result_option)
+    res = getattr(result, result_option + "_")
     if weighted:
         weighted_data = np.diag(weights) @ X
         gtr = function(weighted_data)
@@ -322,19 +320,19 @@ def test_fit_multiple_options_on_random_data(
     else:
         result = incbs.fit(X_df)
 
-    res_mean, res_max, res_sum = result.mean, result.max, result.sum
+    res_mean, res_max, res_sum = result.mean_, result.max_, result.sum_
     if weighted:
         weighted_data = np.diag(weights) @ X
         gtr_mean, gtr_max, gtr_sum = (
-            expected_mean(weighted_data),
-            expected_max(weighted_data),
-            expected_sum(weighted_data),
+            options_and_tests["mean"][0](weighted_data),
+            options_and_tests["max"][0](weighted_data),
+            options_and_tests["sum"][0](weighted_data),
         )
     else:
         gtr_mean, gtr_max, gtr_sum = (
-            expected_mean(X),
-            expected_max(X),
-            expected_sum(X),
+            options_and_tests["mean"][0](X),
+            options_and_tests["max"][0](X),
+            options_and_tests["sum"][0](X),
         )
 
     tol = 3e-4 if res_mean.dtype == np.float32 else 1e-7
@@ -372,13 +370,116 @@ def test_fit_all_option_on_random_data(
     if weighted:
         weighted_data = np.diag(weights) @ X
 
-    for option in options_and_tests:
-        result_option, function, tols = option
+    for result_option in options_and_tests:
+        function, tols = options_and_tests[result_option]
         fp32tol, fp64tol = tols
-        res = getattr(result, result_option)
+        res = getattr(result, result_option + "_")
         if weighted:
             gtr = function(weighted_data)
         else:
             gtr = function(X)
         tol = fp32tol if res.dtype == np.float32 else fp64tol
         assert_allclose(gtr, res, atol=tol)
+
+
+@pytest.mark.parametrize("dataframe,queue", get_dataframes_and_queues())
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_sklearnex_incremental_estimatior_pickle(dataframe, queue, dtype):
+    import pickle
+
+    from sklearnex.basic_statistics import IncrementalBasicStatistics
+
+    incbs = IncrementalBasicStatistics()
+
+    # Check that estimator can be serialized without any data.
+    dump = pickle.dumps(incbs)
+    incbs_loaded = pickle.loads(dump)
+    seed = 77
+    gen = np.random.default_rng(seed)
+    X = gen.uniform(low=-0.3, high=+0.7, size=(10, 10))
+    X = X.astype(dtype)
+    X_split = np.array_split(X, 2)
+    X_split_df = _convert_to_dataframe(X_split[0], sycl_queue=queue, target_df=dataframe)
+    incbs.partial_fit(X_split_df)
+    incbs_loaded.partial_fit(X_split_df)
+
+    # Check that estimator can be serialized after partial_fit call.
+    dump = pickle.dumps(incbs_loaded)
+    incbs_loaded = pickle.loads(dump)
+
+    X_split_df = _convert_to_dataframe(X_split[1], sycl_queue=queue, target_df=dataframe)
+    incbs.partial_fit(X_split_df)
+    incbs_loaded.partial_fit(X_split_df)
+    dump = pickle.dumps(incbs)
+    incbs_loaded = pickle.loads(dump)
+    assert incbs.batch_size == incbs_loaded.batch_size
+    assert incbs.n_features_in_ == incbs_loaded.n_features_in_
+    assert incbs.n_samples_seen_ == incbs_loaded.n_samples_seen_
+    if hasattr(incbs, "_parameter_constraints"):
+        assert incbs._parameter_constraints == incbs_loaded._parameter_constraints
+    assert incbs.n_jobs == incbs_loaded.n_jobs
+    for result_option in options_and_tests:
+        _, tols = options_and_tests[result_option]
+        fp32tol, fp64tol = tols
+        res = getattr(incbs, result_option + "_")
+        res_loaded = getattr(incbs_loaded, result_option + "_")
+        tol = fp32tol if res.dtype == np.float32 else fp64tol
+        assert_allclose(res, res_loaded, atol=tol)
+
+    # Check that finalized estimator can be serialized.
+    dump = pickle.dumps(incbs_loaded)
+    incbs_loaded = pickle.loads(dump)
+    for result_option in options_and_tests:
+        _, tols = options_and_tests[result_option]
+        fp32tol, fp64tol = tols
+        res = getattr(incbs, result_option + "_")
+        res_loaded = getattr(incbs_loaded, result_option + "_")
+        tol = fp32tol if res.dtype == np.float32 else fp64tol
+        assert_allclose(res, res_loaded, atol=tol)
+
+
+@pytest.mark.parametrize("underscore_first", [False, True])
+def test_results_have_underscores(underscore_first):
+    X = np.arange(10).reshape((-1, 1))
+    bs = IncrementalBasicStatistics().fit(X)
+
+    # Note: these are generated dynamically. Need to
+    # test them in different order to ensure calling
+    # one doesn't set the other and then change results.
+    if underscore_first:
+        assert hasattr(bs, "mean_")
+        assert not hasattr(bs, "mean")
+    else:
+        assert not hasattr(bs, "mean")
+        assert hasattr(bs, "mean_")
+
+
+@pytest.mark.skipif(
+    not sklearn_check_version("1.9"),
+    reason="Test for functionality introduced in later scikit-learn versions.",
+)
+@pytest.mark.skipif(
+    not _package_check_version("2.1", np.__version__),
+    reason="Array API functionality requires more recent version of NumPy.",
+)
+@pytest.mark.parametrize(
+    "X_xp",
+    [np, array_api_strict],
+)
+@pytest.mark.parametrize(
+    "w_xp",
+    [np, array_api_strict],
+)
+def test_incbs_weights_in_different_namespace(X_xp, w_xp, with_array_api):
+    from sklearnex.basic_statistics import IncrementalBasicStatistics
+
+    rng = np.random.default_rng(seed=123)
+    X = rng.random(size=(10, 3))
+    w = rng.gamma(1, size=X.shape[0])
+
+    X_ = X_xp.asarray(X)
+    w_ = w_xp.asarray(w)
+
+    incbs = IncrementalBasicStatistics().fit(X_, w_)
+    incbs.partial_fit(X_, w_)
+    incbs.partial_fit(X_, w)

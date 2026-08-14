@@ -15,32 +15,29 @@
 # ===============================================================================
 
 import warnings
+from functools import wraps
 
 import numpy as np
-from sklearn.neighbors import LocalOutlierFactor as sklearn_LocalOutlierFactor
+from sklearn.neighbors import LocalOutlierFactor as _sklearn_LocalOutlierFactor
+from sklearn.utils._array_api import get_namespace
 from sklearn.utils.metaestimators import available_if
 from sklearn.utils.validation import check_is_fitted
 
 from daal4py.sklearn._n_jobs_support import control_n_jobs
-from daal4py.sklearn._utils import sklearn_check_version
+from onedal._device_offload import _transfer_to_host
+from onedal.utils._array_api import _is_numpy_namespace
 from sklearnex._device_offload import dispatch, wrap_output_data
 from sklearnex.neighbors.common import KNeighborsDispatchingBase
 from sklearnex.neighbors.knn_unsupervised import NearestNeighbors
-from sklearnex.utils import get_namespace
+
+from ..utils._array_api import enable_array_api
 
 
-@control_n_jobs(decorated_methods=["fit", "_kneighbors"])
-class LocalOutlierFactor(KNeighborsDispatchingBase, sklearn_LocalOutlierFactor):
-    __doc__ = (
-        sklearn_LocalOutlierFactor.__doc__
-        + "\n NOTE: When X=None, methods kneighbors, kneighbors_graph, and predict will"
-        + "\n only output numpy arrays. In that case, the only way to offload to gpu"
-        + "\n is to use a global queue (e.g. using config_context)"
-    )
-    if sklearn_check_version("1.2"):
-        _parameter_constraints: dict = {
-            **sklearn_LocalOutlierFactor._parameter_constraints
-        }
+@enable_array_api
+@control_n_jobs(decorated_methods=["fit", "kneighbors", "_kneighbors"])
+class LocalOutlierFactor(KNeighborsDispatchingBase, _sklearn_LocalOutlierFactor):
+    __doc__ = _sklearn_LocalOutlierFactor.__doc__
+    _parameter_constraints: dict = {**_sklearn_LocalOutlierFactor._parameter_constraints}
 
     # Only certain methods should be taken from knn to prevent code
     # duplication. Inheriting would yield a complicated inheritance
@@ -49,11 +46,23 @@ class LocalOutlierFactor(KNeighborsDispatchingBase, sklearn_LocalOutlierFactor):
     _onedal_knn_fit = NearestNeighbors._onedal_fit
     _onedal_kneighbors = NearestNeighbors._onedal_kneighbors
 
-    def _onedal_fit(self, X, y, queue=None):
-        if sklearn_check_version("1.2"):
-            self._validate_params()
+    def _local_reachability_density(self, distances_X, neighbors_indices):
+        """The local reachability density (LRD).
 
-        self._onedal_knn_fit(X, y, queue)
+        Array API compatible override of sklearn's implementation.
+        """
+        xp, _ = get_namespace(distances_X, neighbors_indices)
+        dist_k = self._distances_fit_X_[neighbors_indices, self.n_neighbors_ - 1]
+        reach_dist_array = xp.maximum(distances_X, dist_k)
+
+        # 1e-10 to avoid `nan` when nb of duplicates > n_neighbors_:
+        return 1.0 / (xp.mean(reach_dist_array, axis=1) + 1e-10)
+
+    def _onedal_fit(self, X, y, queue=None):
+        self._validate_params()
+
+        # Let _onedal_knn_fit (NearestNeighbors._onedal_fit) handle validation
+        self._onedal_knn_fit(X, y, queue=queue)
 
         if self.contamination != "auto":
             if not (0.0 < self.contamination <= 0.5):
@@ -71,139 +80,134 @@ class LocalOutlierFactor(KNeighborsDispatchingBase, sklearn_LocalOutlierFactor):
                 % (self.n_neighbors, n_samples)
             )
         self.n_neighbors_ = max(1, min(self.n_neighbors, n_samples - 1))
-
         (
             self._distances_fit_X_,
             _neighbors_indices_fit_X_,
         ) = self._onedal_kneighbors(n_neighbors=self.n_neighbors_, queue=queue)
 
-        # Sklearn includes a check for float32 at this point which may not be
-        # necessary for onedal
+        xp, _ = get_namespace(self._distances_fit_X_)
 
         self._lrd = self._local_reachability_density(
             self._distances_fit_X_, _neighbors_indices_fit_X_
         )
 
         # Compute lof score over training samples to define offset_:
-        lrd_ratios_array = self._lrd[_neighbors_indices_fit_X_] / self._lrd[:, np.newaxis]
+        lrd_ratios_array = self._lrd[_neighbors_indices_fit_X_] / xp.reshape(
+            self._lrd, (-1, 1)
+        )
 
-        self.negative_outlier_factor_ = -np.mean(lrd_ratios_array, axis=1)
+        self.negative_outlier_factor_ = -xp.mean(lrd_ratios_array, axis=1)
 
         if self.contamination == "auto":
             # inliers score around -1 (the higher, the less abnormal).
             self.offset_ = -1.5
         else:
-            self.offset_ = np.percentile(
-                self.negative_outlier_factor_, 100.0 * self.contamination
-            )
+            # percentile is not available in all array API implementations,
+            # so transfer to host for this scalar computation.
+            _, (nof_host,) = _transfer_to_host(self.negative_outlier_factor_)
+            self.offset_ = np.percentile(nof_host, 100.0 * self.contamination)
 
+        # adoption of warning for data with duplicated samples from
+        # https://github.com/scikit-learn/scikit-learn/pull/28773
+        if float(xp.min(self.negative_outlier_factor_)) < -1e7 and not self.novelty:
+            warnings.warn(
+                "Duplicate values are leading to incorrect results. "
+                "Increase the number of neighbors for more accurate results."
+            )
         return self
 
     def fit(self, X, y=None):
-        result = dispatch(
+        xp, is_array_api = get_namespace(X)
+        dispatch(
             self,
             "fit",
             {
                 "onedal": self.__class__._onedal_fit,
-                "sklearn": sklearn_LocalOutlierFactor.fit,
+                "sklearn": _sklearn_LocalOutlierFactor.fit,
             },
             X,
             None,
         )
-        return result
+        # Ensure _fit_X matches the input namespace so that
+        # kneighbors(X=None) can use get_namespace(self._fit_X).
+        if is_array_api and not _is_numpy_namespace(xp):
+            device = getattr(X, "device", None)
+            self._fit_X = xp.asarray(self._fit_X, device=device)
+        return self
 
+    # Note: this is overriding an internal method from scikit-learn with
+    # the same signature. In this case, 'validate_data' is called during
+    # 'decision_function', which calls '.kneighbors()'. Hence, it doesn't
+    # need to validate the namespace of 'X' with '_fit_X' here.
     def _predict(self, X=None):
         check_is_fitted(self)
 
         if X is not None:
-            xp, _ = get_namespace(X)
+            xp, is_array_api = get_namespace(X)
             output = self.decision_function(X) < 0
-            is_inlier = xp.ones_like(output, dtype=int)
-            is_inlier[output] = -1
+            dtype = X.dtype if is_array_api else xp.int64
+            ones = xp.ones_like(output, dtype=dtype)
+            is_inlier = xp.where(output, -ones, ones)
         else:
-            is_inlier = np.ones(self.n_samples_fit_, dtype=int)
-            is_inlier[self.negative_outlier_factor_ < self.offset_] = -1
-
+            xp, _ = get_namespace(self.negative_outlier_factor_)
+            sycl_queue = getattr(self.negative_outlier_factor_, "sycl_queue", None)
+            if sycl_queue is not None:
+                is_inlier = xp.ones(
+                    self.n_samples_fit_, dtype=xp.int64, sycl_queue=sycl_queue
+                )
+            else:
+                is_inlier = xp.ones(self.n_samples_fit_, dtype=xp.int64)
+            mask = self.negative_outlier_factor_ < self.offset_
+            is_inlier = xp.where(mask, -is_inlier, is_inlier)
         return is_inlier
 
     # This had to be done because predict loses the queue when no
-    # argument is given and it is a dpctl tensor or dpnp array.
+    # argument is given and it is a dpnp array.
     # This would cause issues in fit_predict. Also, available_if
-    # is hard to unwrap, and this is the most straighforward way.
-    @available_if(sklearn_LocalOutlierFactor._check_novelty_fit_predict)
+    # is hard to unwrap, and this is the most straightforward way.
+    @available_if(_sklearn_LocalOutlierFactor._check_novelty_fit_predict)
+    @wraps(_sklearn_LocalOutlierFactor.fit_predict, assigned=["__doc__"])
     @wrap_output_data
     def fit_predict(self, X, y=None):
-        """Fit the model to the training set X and return the labels.
-
-        **Not available for novelty detection (when novelty is set to True).**
-        Label is 1 for an inlier and -1 for an outlier according to the LOF
-        score and the contamination parameter.
-
-        Parameters
-        ----------
-        X : {array-like, sparse matrix} of shape (n_samples, n_features), default=None
-            The query sample or samples to compute the Local Outlier Factor
-            w.r.t. the training samples.
-
-        y : Ignored
-            Not used, present for API consistency by convention.
-
-        Returns
-        -------
-        is_inlier : ndarray of shape (n_samples,)
-            Returns -1 for anomalies/outliers and 1 for inliers.
-        """
         return self.fit(X)._predict()
 
     def _kneighbors(self, X=None, n_neighbors=None, return_distance=True):
+        if n_neighbors is not None:
+            self._validate_n_neighbors(n_neighbors)
+
         check_is_fitted(self)
-        if sklearn_check_version("1.0") and X is not None:
-            self._check_feature_names(X, reset=False)
+
+        self._kneighbors_validation(X, n_neighbors)
+
         return dispatch(
             self,
             "kneighbors",
             {
                 "onedal": self.__class__._onedal_kneighbors,
-                "sklearn": sklearn_LocalOutlierFactor.kneighbors,
+                "sklearn": _sklearn_LocalOutlierFactor.kneighbors,
             },
             X,
             n_neighbors=n_neighbors,
             return_distance=return_distance,
         )
 
-    kneighbors = wrap_output_data(_kneighbors)
+    @wrap_output_data
+    def kneighbors(self, X=None, n_neighbors=None, return_distance=True):
+        return self._kneighbors(X, n_neighbors, return_distance)
 
-    @available_if(sklearn_LocalOutlierFactor._check_novelty_score_samples)
+    @available_if(_sklearn_LocalOutlierFactor._check_novelty_score_samples)
+    @wraps(_sklearn_LocalOutlierFactor.score_samples, assigned=["__doc__"])
     @wrap_output_data
     def score_samples(self, X):
-        """Opposite of the Local Outlier Factor of X.
-
-        It is the opposite as bigger is better, i.e. large values correspond
-        to inliers.
-
-        **Only available for novelty detection (when novelty is set to True).**
-        The argument X is supposed to contain *new data*: if X contains a
-        point from training, it considers the later in its own neighborhood.
-        Also, the samples in X are not considered in the neighborhood of any
-        point. Because of this, the scores obtained via ``score_samples`` may
-        differ from the standard LOF scores.
-        The standard LOF scores for the training data is available via the
-        ``negative_outlier_factor_`` attribute.
-
-        Parameters
-        ----------
-        X : {array-like, sparse matrix} of shape (n_samples, n_features)
-            The query sample or samples to compute the Local Outlier Factor
-            w.r.t. the training samples.
-
-        Returns
-        -------
-        opposite_lof_scores : ndarray of shape (n_samples,)
-            The opposite of the Local Outlier Factor of each input samples.
-            The lower, the more abnormal.
-        """
         check_is_fitted(self)
 
+        # Note: validate_data is NOT called here because
+        # _kneighbors -> dispatch -> _onedal_kneighbors already validates X.
+        # Calling it here would double-validate (4 calls instead of 2).
+
+        # _kneighbors returns raw dispatch result (numpy from host path).
+        # No transfer needed since _lrd and _distances_fit_X_ are also numpy
+        # (computed during fit on host). Only the final result is converted.
         distances_X, neighbors_indices_X = self._kneighbors(
             X, n_neighbors=self.n_neighbors_
         )
@@ -213,9 +217,10 @@ class LocalOutlierFactor(KNeighborsDispatchingBase, sklearn_LocalOutlierFactor):
             neighbors_indices_X,
         )
 
-        lrd_ratios_array = self._lrd[neighbors_indices_X] / X_lrd[:, np.newaxis]
+        xp, _ = get_namespace(X_lrd)
+        lrd_ratios_array = self._lrd[neighbors_indices_X] / xp.reshape(X_lrd, (-1, 1))
 
-        return -np.mean(lrd_ratios_array, axis=1)
+        return -xp.mean(lrd_ratios_array, axis=1)
 
-    fit.__doc__ = sklearn_LocalOutlierFactor.fit.__doc__
-    kneighbors.__doc__ = sklearn_LocalOutlierFactor.kneighbors.__doc__
+    fit.__doc__ = _sklearn_LocalOutlierFactor.fit.__doc__
+    kneighbors.__doc__ = _sklearn_LocalOutlierFactor.kneighbors.__doc__

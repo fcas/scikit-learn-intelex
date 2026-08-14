@@ -14,6 +14,14 @@
 # limitations under the License.
 # ==============================================================================
 
+from os import environ
+
+# sklearn requires manual enabling of Scipy array API support
+# if `array-api-compat` package is present in environment
+# TODO: create generic approach to handle this for all tests
+environ["SCIPY_ARRAY_API"] = "1"
+
+
 import unittest
 
 import sklearn.utils.estimator_checks
@@ -27,11 +35,7 @@ from daal4py import _get__daal_link_version__ as dv
 daal_version = (int(dv()[0:4]), dv()[10:11], int(dv()[4:8]))
 print("DAAL version:", daal_version)
 
-from daal4py.sklearn.ensemble import (
-    AdaBoostClassifier,
-    GBTDAALClassifier,
-    GBTDAALRegressor,
-)
+from daal4py.sklearn.ensemble import GBTDAALClassifier, GBTDAALRegressor
 
 
 def check_version(rule, target):
@@ -86,9 +90,6 @@ class Test(unittest.TestCase):
         saved = _replace_and_save(md, ["check_estimators_data_not_an_array"], dummy)
         check_estimator(GBTDAALRegressor())
         _restore_from_saved(md, saved)
-
-    def test_AdaBoostClassifier(self):
-        check_estimator(AdaBoostClassifier())
 
 
 if __name__ == "__main__":

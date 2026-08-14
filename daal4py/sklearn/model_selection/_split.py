@@ -18,15 +18,13 @@ import platform
 
 import numpy as np
 from sklearn.model_selection import ShuffleSplit, StratifiedShuffleSplit
+from sklearn.model_selection import train_test_split as _sklearn_train_test_split
 from sklearn.model_selection._split import _validate_shuffle_split
 from sklearn.utils import indexable
 from sklearn.utils.validation import _num_samples
 
 import daal4py as d4p
 from daal4py.sklearn._utils import PatchingConditionsChain
-
-from .._device_offload import support_usm_ndarray
-from .._utils import sklearn_check_version
 
 try:
     from sklearn.utils import _safe_indexing as safe_indexing
@@ -47,10 +45,7 @@ try:
 except (ImportError, ModuleNotFoundError):
     pandas_is_imported = False
 
-if sklearn_check_version("1.3"):
-    import numbers
-
-    from sklearn.utils._param_validation import Interval, RealNotInt, validate_params
+from sklearn.utils._param_validation import StrOptions, validate_params
 
 
 def get_dtypes(data):
@@ -63,40 +58,18 @@ def get_dtypes(data):
     return None
 
 
-@support_usm_ndarray(freefunc=True)
-def train_test_split(*arrays, **options):
+def train_test_split(
+    *arrays,
+    test_size=None,
+    train_size=None,
+    random_state=None,
+    shuffle=True,
+    stratify=None,
+    rng: str = "OPTIMIZED_MT19937",
+):
     n_arrays = len(arrays)
     if n_arrays == 0:
         raise ValueError("At least one array required as input")
-    test_size = options.pop("test_size", None)
-    train_size = options.pop("train_size", None)
-    random_state = options.pop("random_state", None)
-    stratify = options.pop("stratify", None)
-    shuffle = options.pop("shuffle", True)
-    rng = options.pop("rng", "OPTIMIZED_MT19937")
-
-    available_rngs = [
-        "default",
-        "MT19937",
-        "SFMT19937",
-        "MT2203",
-        "R250",
-        "WH",
-        "MCG31",
-        "MCG59",
-        "MRG32K3A",
-        "PHILOX4X32X10",
-        "NONDETERM",
-        "OPTIMIZED_MT19937",
-    ]
-    if rng not in available_rngs:
-        raise ValueError(
-            "Wrong random numbers generator is chosen. "
-            "Available generators: %s" % str(available_rngs)[1:-1]
-        )
-
-    if options:
-        raise TypeError("Invalid parameters passed: %s" % str(options))
 
     arrays = indexable(*arrays)
 
@@ -273,8 +246,8 @@ def train_test_split(*arrays, **options):
                     )
 
             if hasattr(arr, "index"):
-                train_arr.index = train
-                test_arr.index = test
+                train_arr.index = arr.index.take(train)
+                test_arr.index = arr.index.take(test)
 
             if hasattr(arr, "columns"):
                 train_arr.columns = arr.columns
@@ -290,22 +263,27 @@ def train_test_split(*arrays, **options):
     return res
 
 
-if sklearn_check_version("1.3"):
-    train_test_split = validate_params(
-        {
-            "test_size": [
-                Interval(RealNotInt, 0, 1, closed="neither"),
-                Interval(numbers.Integral, 1, None, closed="left"),
-                None,
-            ],
-            "train_size": [
-                Interval(RealNotInt, 0, 1, closed="neither"),
-                Interval(numbers.Integral, 1, None, closed="left"),
-                None,
-            ],
-            "random_state": ["random_state"],
-            "shuffle": ["boolean"],
-            "stratify": ["array-like", None],
-        },
-        prefer_skip_nested_validation=True,
-    )(train_test_split)
+train_test_split = validate_params(
+    {
+        **_sklearn_train_test_split._skl_parameter_constraints,
+        "rng": [
+            StrOptions(
+                {
+                    "default",
+                    "MT19937",
+                    "SFMT19937",
+                    "MT2203",
+                    "R250",
+                    "WH",
+                    "MCG31",
+                    "MCG59",
+                    "MRG32K3A",
+                    "PHILOX4X32X10",
+                    "NONDETERM",
+                    "OPTIMIZED_MT19937",
+                }
+            )
+        ],
+    },
+    prefer_skip_nested_validation=True,
+)(train_test_split)
